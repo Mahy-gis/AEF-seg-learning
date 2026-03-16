@@ -388,7 +388,12 @@ class Trainer:
         total_hours = total_time / 3600
         print(f"\nTraining completed in {total_hours:.2f} hours ({total_time:.0f} seconds)")
 
-    def load_checkpoint(self, checkpoint_path: str, load_optimizer: bool = True) -> int:
+    def load_checkpoint(
+        self,
+        checkpoint_path: str,
+        load_optimizer: bool = True,
+        reset_step: bool = False,
+    ) -> int:
         ckpt_path = Path(checkpoint_path)
         if not ckpt_path.exists():
             raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
@@ -403,7 +408,7 @@ class Trainer:
             self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
 
         step = int(checkpoint.get('step', 0))
-        self.start_step = step
+        self.start_step = 0 if reset_step else step
         return step
     
     def _save_checkpoint(self, step: int):

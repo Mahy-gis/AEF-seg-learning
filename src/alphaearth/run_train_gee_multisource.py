@@ -175,6 +175,20 @@ def main() -> None:
         choices=[0, 1],
         help="If 1, resume from <output_dir>/checkpoint_latest.pt when it exists.",
     )
+    parser.add_argument(
+        "--resume_load_optimizer",
+        type=int,
+        default=1,
+        choices=[0, 1],
+        help="If 1, load optimizer/scaler states from checkpoint; set 0 for fine-tuning with a fresh optimizer.",
+    )
+    parser.add_argument(
+        "--reset_step_on_resume",
+        type=int,
+        default=0,
+        choices=[0, 1],
+        help="If 1, reset trainer step to 0 after loading checkpoint weights.",
+    )
 
     args = parser.parse_args()
 
@@ -285,8 +299,17 @@ def main() -> None:
             resume_path = candidate
 
     if resume_path is not None:
-        resumed_step = trainer.load_checkpoint(str(resume_path), load_optimizer=True)
-        print(f"Resumed from checkpoint: {resume_path} (step={resumed_step})")
+        load_optimizer = bool(args.resume_load_optimizer)
+        reset_step = bool(args.reset_step_on_resume)
+        resumed_step = trainer.load_checkpoint(
+            str(resume_path),
+            load_optimizer=load_optimizer,
+            reset_step=reset_step,
+        )
+        print(
+            f"Resumed from checkpoint: {resume_path} "
+            f"(step={resumed_step}, load_optimizer={load_optimizer}, reset_step={reset_step})"
+        )
 
     print(f"Starting training for {max_steps} steps...")
     print(f"Output directory: {args.output_dir}")

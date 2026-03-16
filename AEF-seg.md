@@ -149,6 +149,25 @@ python -m alphaearth.run_train_gee_multisource \
   --uniformity_weight 0.05 \
   --consistency_weight 0.02
 ```
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+python -m alphaearth.run_train_gee_multisource \
+  --data_dir /mnt/data/RSFM/AEF-seg-learning/data/S1S2/gee_multi1 \
+  --output_dir /mnt/data/RSFM/AEF-seg-learning/data/S1S2/outputs_gee_multisource_tiny \
+  --batch_size 2 \
+  --num_workers 2 \
+  --patch_size 128 \
+  --model_size tiny \
+  --max_steps 3000 \
+  --warmup_steps 0 \
+  --log_every 50 \
+  --device cuda \
+  --reconstruction_weight 1.0 \
+  --uniformity_weight 0.01 \
+  --consistency_weight 0.005 \
+  --reconstruction_sources sentinel1,sentinel2 \
+  --amp 1 \
+  --grad_checkpoint 1
+
 python -m alphaearth.run_train_gee_multisource `
 --data_dir "D:/ProgramFiles/AEF/alphaearth-foundations/data/gee_multi1" `
 --output_dir "D:/ProgramFiles/AEF/alphaearth-foundations/outputs_gee_multisource_tiny" `

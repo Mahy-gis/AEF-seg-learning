@@ -18,18 +18,25 @@ class AEFLoss:
                  reconstruction_weight: float = 1.0,  # a = 1.0
                  uniformity_weight: float = 0.01,    # lower regularization improves reconstruction convergence
                  consistency_weight: float = 0.005,  # lower regularization improves reconstruction convergence
-                 text_weight: float = 0.001):        # d = 0.001
+                 text_weight: float = 0.001,
+                 detail_weight: float = 0.05):       # edge/detail matching term
         
         self.reconstruction_weight = reconstruction_weight
         self.uniformity_weight = uniformity_weight
         self.consistency_weight = consistency_weight
         self.text_weight = text_weight
+        self.detail_weight = detail_weight
         
-        # Source-specific loss configurations from Table S2
+        # Source-specific loss configurations (reconstruction term)
+        # 参考你给出的原始实现：连续型源使用 L1 损失，并允许按源加权。
+        # 这里为当前 S1/S2 训练场景设置默认权重，可按需要调整。
         self.source_configs = {
-            'landsat': {'weight': 1.0, 'loss_name': 'smooth_l1', 'beta': 0.05},
-            'sentinel2': {'weight': 1.0, 'loss_name': 'smooth_l1', 'beta': 0.05},
-            'sentinel1': {'weight': 0.5, 'loss_name': 'smooth_l1', 'beta': 0.05},
+            'landsat':   {'weight': 1.0, 'loss_name': 'l1', 'beta': 0.05},
+            # Slightly up-weight S2 so training focuses more on optical reconstruction fidelity.
+            'sentinel2': {'weight': 1.5, 'loss_name': 'l1', 'beta': 0.05},
+            # S1 噪声更大，这里进一步降低其在重建损失中的权重，
+            # 让模型更关注 S2 的结构重建，减轻 S1 对整体梯度的干扰。
+            'sentinel1': {'weight': 0.1, 'loss_name': 'l1', 'beta': 0.05},
         }
 
     def _masked_regression_loss(
@@ -56,9 +63,19 @@ class AEFLoss:
             return None
 
         if loss_name == 'smooth_l1':
-            per_element = nn.functional.smooth_l1_loss(prediction, target, reduction='none', beta=beta)
+            per_element = nn.functional.smooth_l1_loss(
+                prediction,
+                target,
+                reduction='none',
+                beta=beta,
+            )
         else:
-            per_element = nn.functional.l1_loss(prediction, target, reduction='none')
+            # 与你给出的原始版本保持一致：连续源采用 L1 损失
+            per_element = nn.functional.l1_loss(
+                prediction,
+                target,
+                reduction='none',
+            )
 
         return (per_element * mask).sum() / valid_weight.clamp_min(1.0)
     
@@ -77,7 +94,12 @@ class AEFLoss:
         
         for source in predictions:
             if source in targets:
-                config = self.source_configs.get(source, {'weight': 1.0, 'loss_name': 'smooth_l1', 'beta': 0.05})
+                # 对未知 source，默认使用权重 1.0、L1 损失
+                config = self.source_configs.get(source, {
+                    'weight': 1.0,
+                    'loss_name': 'l1',
+                    'beta': 0.05,
+                })
                 prediction = predictions[source]
                 target = targets[source]
                 mask = masks.get(source, torch.ones_like(target[..., :1]))
@@ -100,7 +122,77 @@ class AEFLoss:
             device = next(iter(predictions.values())).device if predictions else 'cpu'
             return torch.tensor(0.0, device=device)
         return total_loss
-    
+
+    def _masked_detail_loss(
+        self,
+        prediction: torch.Tensor,
+        target: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """Gradient-domain L1 loss to recover sharper pixel-level structures.
+
+        prediction/target: (B, H, W, C)
+        mask: (B, H, W, 1) or broadcastable
+        """
+        mask = mask.to(device=prediction.device, dtype=prediction.dtype)
+
+        while mask.dim() < prediction.dim():
+            mask = mask.unsqueeze(-1)
+
+        if mask.shape != prediction.shape:
+            if mask.shape[-1] == 1 and prediction.shape[-1] != 1:
+                mask = mask.expand_as(prediction)
+            else:
+                mask = torch.broadcast_to(mask, prediction.shape)
+
+        # Finite-difference gradients
+        pred_dx = prediction[:, 1:, :, :] - prediction[:, :-1, :, :]
+        pred_dy = prediction[:, :, 1:, :] - prediction[:, :, :-1, :]
+        tgt_dx = target[:, 1:, :, :] - target[:, :-1, :, :]
+        tgt_dy = target[:, :, 1:, :] - target[:, :, :-1, :]
+
+        # Only count gradients where both adjacent pixels are valid
+        mask_dx = mask[:, 1:, :, :] * mask[:, :-1, :, :]
+        mask_dy = mask[:, :, 1:, :] * mask[:, :, :-1, :]
+
+        w_dx = mask_dx.sum()
+        w_dy = mask_dy.sum()
+        if (w_dx + w_dy).item() <= 0:
+            return None
+
+        loss_dx = ((pred_dx - tgt_dx).abs() * mask_dx).sum() / w_dx.clamp_min(1.0)
+        loss_dy = ((pred_dy - tgt_dy).abs() * mask_dy).sum() / w_dy.clamp_min(1.0)
+        return 0.5 * (loss_dx + loss_dy)
+
+    def detail_loss(
+        self,
+        predictions: Dict[str, torch.Tensor],
+        targets: Dict[str, torch.Tensor],
+        masks: Dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        total = None
+
+        for source in predictions:
+            if source not in targets:
+                continue
+
+            config = self.source_configs.get(source, {'weight': 1.0})
+            prediction = predictions[source]
+            target = targets[source]
+            mask = masks.get(source, torch.ones_like(target[..., :1]))
+
+            loss = self._masked_detail_loss(prediction, target, mask)
+            if loss is None:
+                continue
+
+            weighted = config.get('weight', 1.0) * loss
+            total = weighted if total is None else total + weighted
+
+        if total is None:
+            device = next(iter(predictions.values())).device if predictions else 'cpu'
+            return torch.tensor(0.0, device=device)
+        return total
+
     def batch_uniformity_loss(self, embeddings: torch.Tensor) -> torch.Tensor:
         """
         Compute batch uniformity objective (Equation 4) --> objective: to have the embeddings be uniformly distributed.
@@ -158,8 +250,14 @@ class AEFLoss:
                 outputs.get('masks', {})
             )
             losses['reconstruction'] = recon_loss
+            losses['detail'] = self.detail_loss(
+                outputs['predictions'],
+                outputs['targets'],
+                outputs.get('masks', {}),
+            )
         else:
             losses['reconstruction'] = torch.tensor(0.0)
+            losses['detail'] = torch.tensor(0.0)
         
         if 'embeddings' in outputs:
             uniformity_loss = self.batch_uniformity_loss(outputs['embeddings'])
@@ -187,6 +285,7 @@ class AEFLoss:
         
         total_loss = (
             self.reconstruction_weight * losses['reconstruction'] +
+            self.detail_weight * losses['detail'] +
             self.uniformity_weight * losses['uniformity'] +
             self.consistency_weight * losses['consistency'] +
             self.text_weight * losses['clip']

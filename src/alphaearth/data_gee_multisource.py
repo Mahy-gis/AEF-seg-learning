@@ -24,17 +24,39 @@ class GEEMultiSourceDataset(Dataset):
         if not self.files:
             raise FileNotFoundError(f"No sample_*.npz files found in {self.data_dir}")
 
-        # 过滤整条时间序列三源（L8/S1/S2）都为 0 的样本，避免模型只学到输出票面全黑
-        valid_files = []
+        # 自动检测实际存在的数据源，兼容仅 S1/S2 或 L8/S1/S2 等多种组合
+        detected_sources: List[str] = []
         for f in self.files:
             try:
                 with np.load(f) as data:
-                    landsat = data["landsat"]
-                    sentinel2 = data["sentinel2"]
-                    sentinel1 = data["sentinel1"]
-                    has_visible_signal = np.any(landsat != 0) or np.any(sentinel2 != 0)
-                    has_any_signal = has_visible_signal or np.any(sentinel1 != 0)
-                    if has_visible_signal and has_any_signal:
+                    keys = set(data.keys())
+                    candidates = ["landsat", "sentinel2", "sentinel1"]
+                    detected_sources = [k for k in candidates if k in keys]
+                    if detected_sources:
+                        break
+            except Exception:
+                continue
+
+        if not detected_sources:
+            raise RuntimeError(
+                "No known sources (landsat/sentinel1/sentinel2) found in any sample_*.npz; "
+                "please check download_gee_l8_s1_s2 outputs."
+            )
+
+        self.sources = detected_sources
+
+        # 过滤在所有已检测源上均为全 0 的样本
+        valid_files: List[Path] = []
+        for f in self.files:
+            try:
+                with np.load(f) as data:
+                    has_any_signal = False
+                    for src in self.sources:
+                        arr = data[src]
+                        if np.any(arr != 0):
+                            has_any_signal = True
+                            break
+                    if has_any_signal:
                         valid_files.append(f)
             except Exception:
                 # 如果单个文件损坏或缺键，则直接跳过
@@ -42,7 +64,7 @@ class GEEMultiSourceDataset(Dataset):
 
         if not valid_files:
             raise RuntimeError(
-                "All GEE multi-source samples appear to be all-zero across L8/S1/S2; "
+                "All GEE multi-source samples appear to be all-zero across available sources; "
                 "please check download_gee_l8_s1_s2 outputs."
             )
 
@@ -51,7 +73,7 @@ class GEEMultiSourceDataset(Dataset):
     def __len__(self) -> int:
         return len(self.files)
 
-    def _normalize(self, arr: np.ndarray) -> np.ndarray:
+    def _normalize(self, arr: np.ndarray, source: Optional[str] = None) -> np.ndarray:
         if not self.normalize:
             return arr
         arr = arr.astype(np.float32)
@@ -59,12 +81,32 @@ class GEEMultiSourceDataset(Dataset):
             normalized = np.zeros_like(arr, dtype=np.float32)
             for channel_idx in range(arr.shape[-1]):
                 band = arr[..., channel_idx]
-                v_min = np.nanmin(band)
-                v_max = np.nanmax(band)
-                if v_max > v_min:
-                    normalized[..., channel_idx] = (band - v_min) / (v_max - v_min)
+
+                # For optical sources (especially S2), many padded/missing pixels are 0.
+                # Use robust percentiles over non-zero pixels to avoid dynamic range collapse.
+                if source in {"sentinel2", "landsat"}:
+                    valid = ~np.isclose(band, 0.0)
+                    if np.any(valid):
+                        vals = band[valid]
+                        v_min = np.nanpercentile(vals, 2)
+                        v_max = np.nanpercentile(vals, 98)
+                        if v_max > v_min:
+                            band_norm = (band - v_min) / (v_max - v_min)
+                            band_norm = np.clip(band_norm, 0.0, 1.0)
+                            # Keep explicit invalid pixels as 0
+                            band_norm[~valid] = 0.0
+                            normalized[..., channel_idx] = band_norm
+                        else:
+                            normalized[..., channel_idx] = band
+                    else:
+                        normalized[..., channel_idx] = band
                 else:
-                    normalized[..., channel_idx] = band
+                    v_min = np.nanmin(band)
+                    v_max = np.nanmax(band)
+                    if v_max > v_min:
+                        normalized[..., channel_idx] = (band - v_min) / (v_max - v_min)
+                    else:
+                        normalized[..., channel_idx] = band
             return normalized
 
         v_min = np.nanmin(arr)
@@ -93,33 +135,40 @@ class GEEMultiSourceDataset(Dataset):
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         path = self.files[idx]
         with np.load(path) as data:
-            landsat = data["landsat"]  # (T, H, W, C_L8)
-            sentinel2 = data["sentinel2"]  # (T, H, W, C_S2)
-            sentinel1 = data["sentinel1"]  # (T, H, W, C_S1)
             timestamps = data["timestamps"]  # (T,)
 
-        T_l8, H, W, C_l8 = landsat.shape
-        T_s2, H2, W2, C_s2 = sentinel2.shape
-        T_s1, H3, W3, C_s1 = sentinel1.shape
+            arrays: Dict[str, np.ndarray] = {}
+            frame_valid: Dict[str, np.ndarray] = {}
 
-        if not (H == W == H2 == W2 == H3 == W3 == self.patch_size):
-            raise ValueError("All inputs must share the same patch size; adjust download script or dataset.")
+            T_list: List[int] = []
+            H = W = None
+            for src in self.sources:
+                arr = data[src]
+                if arr.ndim != 4:
+                    raise ValueError(f"Source {src} must have shape (T, H, W, C), got {arr.shape}")
+                T_src, H_src, W_src, _ = arr.shape
+                if H_src != self.patch_size or W_src != self.patch_size:
+                    raise ValueError(
+                        "All inputs must share the same patch size and match patch_size; "
+                        "adjust download script or dataset."
+                    )
+                arrays[src] = arr
+                frame_valid[src] = self._frame_valid_mask(arr)
+                T_list.append(T_src)
+                H, W = H_src, W_src
 
-        frame_valid_l8 = self._frame_valid_mask(landsat)
-        frame_valid_s2 = self._frame_valid_mask(sentinel2)
-        frame_valid_s1 = self._frame_valid_mask(sentinel1)
+        T = int(max(T_list))
 
-        T = int(max(T_l8, T_s2, T_s1))
+        # 对每个源在时间维进行 pad，并做归一化
+        for src in self.sources:
+            arr, mask = self._pad_time(arrays[src], frame_valid[src], T)
+            arrays[src] = self._normalize(arr, source=src)
+            frame_valid[src] = mask
 
-        landsat, frame_valid_l8 = self._pad_time(landsat, frame_valid_l8, T)
-        sentinel2, frame_valid_s2 = self._pad_time(sentinel2, frame_valid_s2, T)
-        sentinel1, frame_valid_s1 = self._pad_time(sentinel1, frame_valid_s1, T)
-
-        landsat = self._normalize(landsat)
-        sentinel2 = self._normalize(sentinel2)
-        sentinel1 = self._normalize(sentinel1)
-
-        keep_mask = frame_valid_l8 | frame_valid_s2 | frame_valid_s1
+        # 至少在任一源上为非 0 的时间步才保留
+        keep_mask = np.zeros((T,), dtype=bool)
+        for src in self.sources:
+            keep_mask |= frame_valid[src]
 
         ts = np.array(timestamps, dtype=np.float64)
         if ts.shape[0] < T:
@@ -132,21 +181,18 @@ class GEEMultiSourceDataset(Dataset):
 
         # 若存在需要过滤的时间步且不全部被过滤，则按掩码裁剪时间维
         if keep_mask.any() and not keep_mask.all():
-            landsat = landsat[keep_mask]
-            sentinel2 = sentinel2[keep_mask]
-            sentinel1 = sentinel1[keep_mask]
             ts = ts[keep_mask]
-            frame_valid_l8 = frame_valid_l8[keep_mask]
-            frame_valid_s2 = frame_valid_s2[keep_mask]
-            frame_valid_s1 = frame_valid_s1[keep_mask]
+            for src in self.sources:
+                arrays[src] = arrays[src][keep_mask]
+                frame_valid[src] = frame_valid[src][keep_mask]
 
-        landsat_tensor = torch.from_numpy(landsat).float()
-        sentinel2_tensor = torch.from_numpy(sentinel2).float()
-        sentinel1_tensor = torch.from_numpy(sentinel1).float()
         ts_tensor = torch.from_numpy(ts.astype(np.float32))
-        frame_valid_l8_tensor = torch.from_numpy(frame_valid_l8.astype(np.bool_))
-        frame_valid_s2_tensor = torch.from_numpy(frame_valid_s2.astype(np.bool_))
-        frame_valid_s1_tensor = torch.from_numpy(frame_valid_s1.astype(np.bool_))
+
+        source_data_tensors: Dict[str, torch.Tensor] = {}
+        frame_mask_tensors: Dict[str, torch.Tensor] = {}
+        for src in self.sources:
+            source_data_tensors[src] = torch.from_numpy(arrays[src]).float()
+            frame_mask_tensors[src] = torch.from_numpy(frame_valid[src].astype(np.bool_))
 
         if ts.size > 0:
             valid_start = float(ts[0])
@@ -156,21 +202,9 @@ class GEEMultiSourceDataset(Dataset):
             valid_end = 0.0
 
         return {
-            "source_data": {
-                "landsat": landsat_tensor,
-                "sentinel1": sentinel1_tensor,
-                "sentinel2": sentinel2_tensor,
-            },
-            "timestamps": {
-                "landsat": ts_tensor,
-                "sentinel1": ts_tensor,
-                "sentinel2": ts_tensor,
-            },
-            "frame_valid_mask": {
-                "landsat": frame_valid_l8_tensor,
-                "sentinel1": frame_valid_s1_tensor,
-                "sentinel2": frame_valid_s2_tensor,
-            },
+            "source_data": source_data_tensors,
+            "timestamps": {src: ts_tensor for src in self.sources},
+            "frame_valid_mask": frame_mask_tensors,
             "valid_period": (valid_start, valid_end),
         }
 

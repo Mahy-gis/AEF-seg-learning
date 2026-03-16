@@ -3,6 +3,7 @@ from einops import rearrange
 import torch
 from torch.functional import F 
 import torch.nn as nn
+import torch.utils.checkpoint as checkpoint_utils
 
 from alphaearth.architecture.STPBlock import STPBlock
 from alphaearth.architecture.laplacian_pyramid_exchange import LearnedSpatialResampling
@@ -14,11 +15,20 @@ class STPEncoder(nn.Module):
  
     """
     
-    def __init__(self, input_channels: int, d_s: int = 1024, d_t: int = 512, d_p: int = 128, num_blocks: int = 15):
+    def __init__(
+        self,
+        input_channels: int,
+        d_s: int = 1024,
+        d_t: int = 512,
+        d_p: int = 128,
+        num_blocks: int = 15,
+        use_gradient_checkpointing: bool = False,
+    ):
         super().__init__()
         self.space_dim = d_s
         self.time_dim = d_t
         self.precision_dim = d_p
+        self.use_gradient_checkpointing = use_gradient_checkpointing
         
         # Individual source encoders transform inputs to same latent space
         self.input_projection = nn.Linear(input_channels, self.precision_dim)
@@ -77,9 +87,21 @@ class STPEncoder(nn.Module):
 
         # Apply STP blocks
         for block in self.blocks:
-            space_features, time_features, precision_features = block(
-                space_features, time_features, precision_features, timestamps
-            )
+            if self.use_gradient_checkpointing and self.training:
+                def _block_forward(space_x, time_x, precision_x):
+                    return block(space_x, time_x, precision_x, timestamps)
+
+                space_features, time_features, precision_features = checkpoint_utils.checkpoint(
+                    _block_forward,
+                    space_features,
+                    time_features,
+                    precision_features,
+                    use_reentrant=False,
+                )
+            else:
+                space_features, time_features, precision_features = block(
+                    space_features, time_features, precision_features, timestamps
+                )
         
         # Final learned spatial resampling to precision resolution
         space_2d = rearrange(space_features, 'b t h w c -> (b t) c h w')

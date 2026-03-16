@@ -1,5 +1,6 @@
 import argparse
 from pathlib import Path
+from typing import Dict
 
 import torch
 
@@ -81,7 +82,7 @@ def main() -> None:
     parser.add_argument(
         "--lr",
         type=float,
-        default=1e-5,
+        default=1e-6,
         help="Learning rate",
     )
     parser.add_argument(
@@ -109,6 +110,24 @@ def main() -> None:
         help="Weight for teacher-student consistency loss term (default 0.005)",
     )
     parser.add_argument(
+        "--detail_weight",
+        type=float,
+        default=0.05,
+        help="Weight for gradient/detail reconstruction loss term (default 0.05).",
+    )
+    parser.add_argument(
+        "--uniformity_ramp_steps",
+        type=int,
+        default=0,
+        help="Linearly ramp uniformity weight from 0 to target over this many steps (0 disables ramp).",
+    )
+    parser.add_argument(
+        "--consistency_ramp_steps",
+        type=int,
+        default=0,
+        help="Linearly ramp consistency weight from 0 to target over this many steps (0 disables ramp).",
+    )
+    parser.add_argument(
         "--model_size",
         type=str,
         default="small",
@@ -128,6 +147,33 @@ def main() -> None:
             "By default all three sources are reconstructed, while Landsat/S1/S2 are always concatenated "
             "as encoder inputs before STP processing."
         ),
+    )
+    parser.add_argument(
+        "--amp",
+        type=int,
+        default=1,
+        choices=[0, 1],
+        help="Enable mixed precision training on CUDA (1=on, 0=off).",
+    )
+    parser.add_argument(
+        "--grad_checkpoint",
+        type=int,
+        default=1,
+        choices=[0, 1],
+        help="Enable gradient checkpointing in STP encoder blocks (1=on, 0=off).",
+    )
+    parser.add_argument(
+        "--resume_checkpoint",
+        type=str,
+        default=None,
+        help="Path to a checkpoint (.pt) to resume training from.",
+    )
+    parser.add_argument(
+        "--resume_latest",
+        type=int,
+        default=0,
+        choices=[0, 1],
+        help="If 1, resume from <output_dir>/checkpoint_latest.pt when it exists.",
     )
 
     args = parser.parse_args()
@@ -160,25 +206,32 @@ def main() -> None:
     print(f"Dataset: {dataset_size} samples, {steps_per_epoch} steps/epoch")
     print(f"Training for {max_steps} steps ({max_steps / steps_per_epoch:.2f} epochs)")
 
-    landsat_channels = dataloader.dataset[0]["source_data"]["landsat"].shape[-1]
-    sentinel1_channels = dataloader.dataset[0]["source_data"]["sentinel1"].shape[-1]
-    sentinel2_channels = dataloader.dataset[0]["source_data"]["sentinel2"].shape[-1]
-    channel_map = {
-        "landsat": landsat_channels,
-        "sentinel1": sentinel1_channels,
-        "sentinel2": sentinel2_channels,
-    }
-    decode_sources = {name: channel_map[name] for name in args.reconstruction_sources}
+    # 自动根据数据集确定可用的数据源与通道数，兼容仅 S1/S2 的数据
+    first_sample = dataloader.dataset[0]
+    available_sources = list(first_sample["source_data"].keys())
+    channel_map = {name: first_sample["source_data"][name].shape[-1] for name in available_sources}
+
+    print(f"Available sources in dataset: {available_sources}")
+
+    decode_sources: Dict[str, int] = {}
+    for name in args.reconstruction_sources:
+        if name in channel_map:
+            decode_sources[name] = channel_map[name]
+        else:
+            print(f"Warning: requested reconstruction source '{name}' not present in dataset; ignoring.")
+
+    if not decode_sources:
+        raise ValueError(
+            "None of the requested reconstruction_sources are present in the dataset. "
+            "Please check --reconstruction_sources and the GEE samples."
+        )
 
     model = AlphaEarthFoundations(
         model_size=args.model_size,
-        input_sources={
-            "landsat": landsat_channels,
-            "sentinel1": sentinel1_channels,
-            "sentinel2": sentinel2_channels,
-        },
+        input_sources=channel_map,
         decode_sources=decode_sources,
     )
+    model.encoder.use_gradient_checkpointing = bool(args.grad_checkpoint)
 
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -191,6 +244,8 @@ def main() -> None:
     print(f"Model size: {args.model_size}")
     print(f"Input sources: {model.input_sources}")
     print(f"Decode sources: {model.decode_sources}")
+    print(f"AMP enabled: {bool(args.amp)}")
+    print(f"Gradient checkpointing enabled: {bool(args.grad_checkpoint)}")
     print(f"\nTotal parameters: {total_params:,}")
     print(f"Trainable parameters: {trainable_params:,}")
     print(f"Non-trainable parameters: {non_trainable_params:,}")
@@ -212,10 +267,26 @@ def main() -> None:
         reconstruction_weight=args.reconstruction_weight,
         uniformity_weight=args.uniformity_weight,
         consistency_weight=args.consistency_weight,
+        detail_weight=args.detail_weight,
+        use_amp=bool(args.amp),
+        uniformity_ramp_steps=args.uniformity_ramp_steps,
+        consistency_ramp_steps=args.consistency_ramp_steps,
     )
 
     trainer.max_steps = max_steps
     trainer.warmup_steps = args.warmup_steps
+
+    resume_path = None
+    if args.resume_checkpoint is not None:
+        resume_path = Path(args.resume_checkpoint)
+    elif bool(args.resume_latest):
+        candidate = Path(args.output_dir) / 'checkpoint_latest.pt'
+        if candidate.exists():
+            resume_path = candidate
+
+    if resume_path is not None:
+        resumed_step = trainer.load_checkpoint(str(resume_path), load_optimizer=True)
+        print(f"Resumed from checkpoint: {resume_path} (step={resumed_step})")
 
     print(f"Starting training for {max_steps} steps...")
     print(f"Output directory: {args.output_dir}")

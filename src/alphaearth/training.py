@@ -2,6 +2,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import itertools
 import math
 import time
+import random
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -27,7 +28,11 @@ class Trainer:
                  reconstruction_weight: float = 1.0,
                  uniformity_weight: float = 0.01,
                  consistency_weight: float = 0.005,
-                 text_weight: float = 0.001):
+                 detail_weight: float = 0.05,
+                 text_weight: float = 0.001,
+                 use_amp: bool = True,
+                 uniformity_ramp_steps: int = 0,
+                 consistency_ramp_steps: int = 0):
         self.model = model
         self.dataloader = dataloader
         self.text_adapter = text_adapter
@@ -38,9 +43,15 @@ class Trainer:
             reconstruction_weight=reconstruction_weight,
             uniformity_weight=uniformity_weight,
             consistency_weight=consistency_weight,
+            detail_weight=detail_weight,
             text_weight=text_weight,
         )
+        self.base_uniformity_weight = uniformity_weight
+        self.base_consistency_weight = consistency_weight
+        self.uniformity_ramp_steps = max(0, int(uniformity_ramp_steps))
+        self.consistency_ramp_steps = max(0, int(consistency_ramp_steps))
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+        self.use_amp = bool(use_amp) and self.device.type == 'cuda'
         self.model.to(self.device)
         if self.text_adapter is not None:
             self.text_adapter.to(self.device)
@@ -48,15 +59,18 @@ class Trainer:
         if self.text_adapter is not None and any(p.requires_grad for p in self.text_adapter.parameters()):
             params += [p for p in self.text_adapter.parameters() if p.requires_grad]
         self.optim = torch.optim.Adam(params, lr=lr)
+        self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
         self.output_dir = output_dir
         self.max_steps = 1000
         self.warmup_steps = 0
+        self.start_step = 0
         self._visualization_batches: Optional[Dict[str, Dict[str, Any]]] = None
         # Track losses for visualization
         self.loss_history = {
             'steps': [],
             'total': [],
             'reconstruction': [],
+            'detail': [],
             'uniformity': [],
             'consistency': [],
             'clip': [],
@@ -241,13 +255,33 @@ class Trainer:
 
     def train(self, max_steps: Optional[int] = None, log_every: int = 20):
         steps = max_steps or self.max_steps
+        if self.start_step >= steps:
+            print(
+                f"Resume step ({self.start_step}) is already >= max_steps ({steps}); "
+                "nothing to train. Increase --max_steps to continue."
+            )
+            return
+
         self.model.train()
         data_iter = itertools.cycle(self.dataloader)
 
-        pbar = tqdm(range(1, steps + 1), desc="Training", unit="step")
+        pbar = tqdm(range(self.start_step + 1, steps + 1), desc="Training", unit="step")
         start_time = time.time()
         
         for step in pbar:
+            # Gradually enable regularization so early training focuses on reconstruction.
+            if self.uniformity_ramp_steps > 0:
+                uni_scale = min(1.0, step / float(self.uniformity_ramp_steps))
+                self.loss_fn.uniformity_weight = self.base_uniformity_weight * uni_scale
+            else:
+                self.loss_fn.uniformity_weight = self.base_uniformity_weight
+
+            if self.consistency_ramp_steps > 0:
+                cons_scale = min(1.0, step / float(self.consistency_ramp_steps))
+                self.loss_fn.consistency_weight = self.base_consistency_weight * cons_scale
+            else:
+                self.loss_fn.consistency_weight = self.base_consistency_weight
+
             batch = next(data_iter)
             step_start_time = time.time()
             
@@ -265,49 +299,56 @@ class Trainer:
             
             preselected_targets, preselected_masks, target_timestamps = self._select_reconstruction_data(batch)
 
-            out = self.model(
-                source_data,
-                timestamps,
-                valid_periods,
-                temporal_masks=frame_valid_masks,
-                decode_timestamps=target_timestamps,
-            )
+            with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=self.use_amp):
+                out = self.model(
+                    source_data,
+                    timestamps,
+                    valid_periods,
+                    temporal_masks=frame_valid_masks,
+                    decode_timestamps=target_timestamps,
+                )
 
-            predictions: Dict[str, torch.Tensor] = {}
-            for src, rec in out['reconstructions'].items():
-                predictions[src] = rec[:, 0]
+                predictions: Dict[str, torch.Tensor] = {}
+                for src, rec in out['reconstructions'].items():
+                    predictions[src] = rec[:, 0]
 
-            targets = {src: target for src, target in preselected_targets.items() if src in predictions}
-            target_masks = {src: mask for src, mask in preselected_masks.items() if src in predictions}
-            predictions = {src: pred for src, pred in predictions.items() if src in targets}
+                targets = {src: target for src, target in preselected_targets.items() if src in predictions}
+                target_masks = {src: mask for src, mask in preselected_masks.items() if src in predictions}
+                predictions = {src: pred for src, pred in predictions.items() if src in targets}
 
-            # Optional text embeddings for text-image alignment loss
-            text_embeddings = None
-            if self.text_adapter is not None and 'texts' in batch:
-                text_embeddings = self.text_adapter.encode(batch['texts'], device=self.device)
+                # Optional text embeddings for text-image alignment loss
+                text_embeddings = None
+                if self.text_adapter is not None and 'texts' in batch:
+                    text_embeddings = self.text_adapter.encode(batch['texts'], device=self.device)
 
-            outputs_for_loss: Dict[str, Any] = {
-                'embeddings': out['embeddings'],
-                'teacher_embeddings': out['teacher_embeddings'],
-                'student_embeddings': out['student_embeddings'],
-                'image_embeddings': out['image_embeddings'],
-                'predictions': predictions,
-                'targets': targets,
-                'masks': target_masks,
-            }
-            if text_embeddings is not None and text_embeddings.shape[0] == out['image_embeddings'].shape[0]:
-                outputs_for_loss['text_embeddings'] = text_embeddings
+                outputs_for_loss: Dict[str, Any] = {
+                    'embeddings': out['embeddings'],
+                    'teacher_embeddings': out['teacher_embeddings'],
+                    'student_embeddings': out['student_embeddings'],
+                    'image_embeddings': out['image_embeddings'],
+                    'predictions': predictions,
+                    'targets': targets,
+                    'masks': target_masks,
+                }
+                if text_embeddings is not None and text_embeddings.shape[0] == out['image_embeddings'].shape[0]:
+                    outputs_for_loss['text_embeddings'] = text_embeddings
 
-            losses = self.loss_fn(outputs_for_loss)
-            loss = losses['total']
+                losses = self.loss_fn(outputs_for_loss)
+                loss = losses['total']
 
             self.optim.zero_grad(set_to_none=True)
-            loss.backward()
-            self.optim.step()
+            if self.use_amp:
+                self.scaler.scale(loss).backward()
+                self.scaler.step(self.optim)
+                self.scaler.update()
+            else:
+                loss.backward()
+                self.optim.step()
 
             self.loss_history['steps'].append(step)
             self.loss_history['total'].append(float(loss))
             self.loss_history['reconstruction'].append(float(losses.get('reconstruction', torch.tensor(0.0))))
+            self.loss_history['detail'].append(float(losses.get('detail', torch.tensor(0.0))))
             self.loss_history['uniformity'].append(float(losses.get('uniformity', torch.tensor(0.0))))
             self.loss_history['consistency'].append(float(losses.get('consistency', torch.tensor(0.0))))
             self.loss_history['clip'].append(float(losses.get('clip', torch.tensor(0.0))))
@@ -320,6 +361,7 @@ class Trainer:
             
             if step % log_every == 0:
                 recon = float(losses.get('reconstruction', torch.tensor(0.0)))
+                detail = float(losses.get('detail', torch.tensor(0.0)))
                 uni = float(losses.get('uniformity', torch.tensor(0.0)))
                 cons = float(losses.get('consistency', torch.tensor(0.0)))
                 clip = float(losses.get('clip', torch.tensor(0.0)))
@@ -329,7 +371,8 @@ class Trainer:
                 eta_seconds = remaining_steps / steps_per_sec if steps_per_sec > 0 else 0
                 eta_hours = eta_seconds / 3600
                 print(f"\nstep {step:05d}/{steps:05d} ({step/steps*100:.1f}%) | "
-                      f"total {float(loss):.4f} | recon {recon:.4f} | uni {uni:.4f} | cons {cons:.4f} | clip {clip:.4f} | "
+                    f"total {float(loss):.4f} | recon {recon:.4f} | detail {detail:.4f} | uni {uni:.4f} | cons {cons:.4f} | clip {clip:.4f} | "
+                        f"w_uni {self.loss_fn.uniformity_weight:.4f} | w_cons {self.loss_fn.consistency_weight:.4f} | "
                       f"ETA: {eta_hours:.2f}h ({steps_per_sec:.2f} steps/s)")
             
             if self.output_dir:
@@ -344,6 +387,24 @@ class Trainer:
         total_time = time.time() - start_time
         total_hours = total_time / 3600
         print(f"\nTraining completed in {total_hours:.2f} hours ({total_time:.0f} seconds)")
+
+    def load_checkpoint(self, checkpoint_path: str, load_optimizer: bool = True) -> int:
+        ckpt_path = Path(checkpoint_path)
+        if not ckpt_path.exists():
+            raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+
+        checkpoint = torch.load(ckpt_path, map_location=self.device)
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+
+        if load_optimizer and 'optimizer_state_dict' in checkpoint:
+            self.optim.load_state_dict(checkpoint['optimizer_state_dict'])
+
+        if self.use_amp and checkpoint.get('scaler_state_dict') is not None:
+            self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
+
+        step = int(checkpoint.get('step', 0))
+        self.start_step = step
+        return step
     
     def _save_checkpoint(self, step: int):
         output_path = Path(self.output_dir)
@@ -352,6 +413,7 @@ class Trainer:
             'step': step,
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optim.state_dict(),
+            'scaler_state_dict': self.scaler.state_dict() if self.use_amp else None,
             'model_config': {
                 'input_sources': dict(getattr(self.model, 'input_sources', {})),
                 'decode_sources': dict(getattr(self.model, 'decode_sources', {})),
@@ -363,13 +425,47 @@ class Trainer:
         output_path = Path(self.output_dir) / 'reconstructions'
         output_path.mkdir(parents=True, exist_ok=True)
 
-        preview_batches = self._prepare_visualization_batches()
+        dataset = self.dataloader.dataset
+        collate_fn = getattr(self.dataloader, 'collate_fn', None)
+        if collate_fn is None:
+            return
+
+        # 每次保存时为每个源随机抽取少量样本，而不是固定使用同一张影像
+        # 注意控制样本数量，避免在大模型/长时间序列上导致显存占用过高。
+        max_samples_per_source = 4
         for src_name in self.model.decode_sources.keys():
-            preview_batch = preview_batches.get(src_name)
-            if preview_batch is None:
+            indices = list(range(len(dataset)))
+            random.shuffle(indices)
+
+            selected_samples: List[Dict[str, Any]] = []
+            for idx in indices:
+                sample = dataset[idx]
+                frame_masks = sample.get('frame_valid_mask', {})
+                has_valid = False
+                if src_name in frame_masks and bool(frame_masks[src_name].any()):
+                    has_valid = True
+                elif src_name not in frame_masks and bool(sample['source_data'][src_name].abs().sum() > 0):
+                    has_valid = True
+                if has_valid:
+                    selected_samples.append(sample)
+                if len(selected_samples) >= max_samples_per_source:
+                    break
+
+            if not selected_samples:
                 continue
 
-            predictions, targets, masks = self._run_reconstruction_preview(preview_batch)
+            preview_batch = collate_fn(selected_samples)
+
+            try:
+                predictions, targets, masks = self._run_reconstruction_preview(preview_batch)
+            except RuntimeError as e:
+                # 若在可视化阶段出现 CUDA OOM，则跳过本次可视化以保证训练不中断。
+                if 'out of memory' in str(e).lower():
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    print(f"Warning: CUDA OOM during reconstruction preview for source '{src_name}' at step {step}; skipping visualization.")
+                    continue
+                raise
             if src_name not in predictions or src_name not in targets or src_name not in masks:
                 continue
 
@@ -465,7 +561,11 @@ def create_trainer(model: AlphaEarthFoundations,
                    reconstruction_weight: float = 1.0,
                    uniformity_weight: float = 0.01,
                    consistency_weight: float = 0.005,
-                   text_weight: float = 0.001) -> Trainer:
+                   detail_weight: float = 0.05,
+                   text_weight: float = 0.001,
+                   use_amp: bool = True,
+                   uniformity_ramp_steps: int = 0,
+                   consistency_ramp_steps: int = 0) -> Trainer:
     return Trainer(
         model=model,
         dataloader=dataloader,
@@ -476,5 +576,9 @@ def create_trainer(model: AlphaEarthFoundations,
         reconstruction_weight=reconstruction_weight,
         uniformity_weight=uniformity_weight,
         consistency_weight=consistency_weight,
+        detail_weight=detail_weight,
         text_weight=text_weight,
+        use_amp=use_amp,
+        uniformity_ramp_steps=uniformity_ramp_steps,
+        consistency_ramp_steps=consistency_ramp_steps,
     )

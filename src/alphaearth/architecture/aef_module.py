@@ -40,7 +40,10 @@ class TimePooling(nn.Module):
         BHW = B * H * W
 
         # keys/values from temporal features at each (h,w)
-        x = feats.view(BHW, T, C)                                      # (BHW, T, C)
+        # IMPORTANT: keep token order explicit as (b, h, w, t, c).
+        # Using view(BHW, T, C) on (B, T, H, W, C) can mix spatial/time order
+        # in memory and introduces structured artifacts in temporal attention.
+        x = rearrange(feats, 'b t h w c -> (b h w) t c')               # (BHW, T, C)
         kv = self.kv(x).view(BHW, T, 2, self.num_heads, self.head_dim)
         K, V = kv[:, :, 0], kv[:, :, 1]                                # (BHW, T, heads, d)
         K = K.permute(0, 2, 1, 3)                                      # (BHW, heads, T, d)

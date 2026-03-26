@@ -1,19 +1,20 @@
 import argparse
 from pathlib import Path
-from typing import Tuple, List
+from typing import Tuple, List, Optional
 import re
 
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader, Subset
+from torch.utils.data import Dataset, DataLoader, Subset, WeightedRandomSampler
 from scipy.ndimage import zoom
+import matplotlib.pyplot as plt
 
 
 # ---------- Data preparation helpers ----------
 
 
-def prepare_features_from_embeddings(emb_npz: Path) -> np.ndarray:
+def prepare_features_from_embeddings(emb_npz: Path, embedding_key: str = "auto") -> np.ndarray:
     """Load embeddings npz and return features as (C,H,W) float32.
 
     Supports two formats:
@@ -22,7 +23,23 @@ def prepare_features_from_embeddings(emb_npz: Path) -> np.ndarray:
     """
     data = np.load(emb_npz)
 
-    if "embeddings_per_time" in data:
+    if embedding_key != "auto":
+        if embedding_key not in data:
+            raise ValueError(f"Embedding key '{embedding_key}' not found in {emb_npz}")
+        e = data[embedding_key]
+        if e.ndim == 4:
+            if e.shape[-1] != 64:
+                raise ValueError(f"Unexpected {embedding_key} shape {e.shape} in {emb_npz}")
+            e_chw = np.transpose(e, (0, 3, 1, 2))
+            T, C, H, W = e_chw.shape
+            feats = e_chw.reshape(T * C, H, W)
+        elif e.ndim == 3:
+            if e.shape[-1] != 64:
+                raise ValueError(f"Unexpected {embedding_key} shape {e.shape} in {emb_npz}")
+            feats = np.transpose(e, (2, 0, 1))
+        else:
+            raise ValueError(f"Unsupported {embedding_key} ndim={e.ndim} in {emb_npz}")
+    elif "embeddings_per_time" in data:
         e = data["embeddings_per_time"]  # (T,H,W,64)
         if e.ndim != 4 or e.shape[-1] != 64:
             raise ValueError(f"Unexpected embeddings_per_time shape {e.shape} in {emb_npz}")
@@ -72,9 +89,16 @@ class EmbeddingSegmentationDataset(Dataset):
     pattern ParcelIDs_XXXXX_labels.npz, and embeddings are named
     embedding_XXXXX*.npz (or any name ending with the same numeric XXXXX).
     """
-    def __init__(self, embeddings_path: Path, labels_path: Path, per_patch_labels: bool = False):
+    def __init__(
+        self,
+        embeddings_path: Path,
+        labels_path: Path,
+        per_patch_labels: bool = False,
+        embedding_key: str = "auto",
+    ):
         self.embeddings_path = embeddings_path
         self.per_patch_labels = per_patch_labels
+        self.embedding_key = embedding_key
 
         if per_patch_labels:
             if not labels_path.is_dir():
@@ -115,7 +139,7 @@ class EmbeddingSegmentationDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         emb_file = self.files[idx]
-        feats = prepare_features_from_embeddings(emb_file)  # (C,H,W)
+        feats = prepare_features_from_embeddings(emb_file, embedding_key=self.embedding_key)  # (C,H,W)
 
         if self.per_patch_labels:
             # Parse numeric suffix XXXXX from embedding filename (e.g., embedding_XXXXX.npz
@@ -151,18 +175,190 @@ class EmbeddingSegmentationDataset(Dataset):
         return features, labels
 
 
+class AugmentedTrainDataset(Dataset):
+    """Wrap a dataset with stochastic train-time augmentation and repeat factor.
+
+    This creates a virtual larger dataset via repeated indexing while applying
+    random geometric/intensity transforms to embeddings each access.
+    """
+
+    def __init__(
+        self,
+        base_dataset: Dataset,
+        repeat_factor: int = 1,
+        flip_prob: float = 0.5,
+        rot90_prob: float = 0.5,
+        noise_std: float = 0.01,
+        gain_std: float = 0.05,
+        crop_size: int = 0,
+        foreground_crop_prob: float = 0.0,
+        background_index: int = 0,
+        ignore_index: int = 19,
+    ):
+        self.base_dataset = base_dataset
+        self.repeat_factor = max(1, int(repeat_factor))
+        self.flip_prob = float(np.clip(flip_prob, 0.0, 1.0))
+        self.rot90_prob = float(np.clip(rot90_prob, 0.0, 1.0))
+        self.noise_std = max(0.0, float(noise_std))
+        self.gain_std = max(0.0, float(gain_std))
+        self.crop_size = max(0, int(crop_size))
+        self.foreground_crop_prob = float(np.clip(foreground_crop_prob, 0.0, 1.0))
+        self.background_index = int(background_index)
+        self.ignore_index = int(ignore_index)
+
+    def __len__(self) -> int:
+        return len(self.base_dataset) * self.repeat_factor
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        x, y = self.base_dataset[idx % len(self.base_dataset)]
+
+        # Clone to avoid in-place mutation of tensors returned by base dataset.
+        x = x.clone()
+        y = y.clone()
+
+        # Random flips (geometric transforms must be applied to both x and y).
+        if torch.rand(1).item() < self.flip_prob:
+            x = torch.flip(x, dims=[2])
+            y = torch.flip(y, dims=[1])
+        if torch.rand(1).item() < self.flip_prob:
+            x = torch.flip(x, dims=[1])
+            y = torch.flip(y, dims=[0])
+
+        # Random 90-degree rotation avoids interpolation artifacts for labels.
+        if torch.rand(1).item() < self.rot90_prob:
+            k = int(torch.randint(0, 4, (1,)).item())
+            if k > 0:
+                x = torch.rot90(x, k=k, dims=[1, 2])
+                y = torch.rot90(y, k=k, dims=[0, 1])
+
+        # Intensity jitter for embeddings (labels unchanged).
+        if self.gain_std > 0:
+            gain = 1.0 + torch.randn(1, dtype=x.dtype).item() * self.gain_std
+            x = x * gain
+        if self.noise_std > 0:
+            x = x + torch.randn_like(x) * self.noise_std
+
+        # Foreground-aware random crop increases effective fg pixel ratio.
+        if self.crop_size > 0:
+            _, h, w = x.shape
+            cs = min(self.crop_size, h, w)
+            if cs < h or cs < w:
+                top, left = 0, 0
+                use_fg_center = torch.rand(1).item() < self.foreground_crop_prob
+                if use_fg_center:
+                    fg_mask = (y != self.background_index) & (y != self.ignore_index)
+                    fg_idx = torch.nonzero(fg_mask, as_tuple=False)
+                    if fg_idx.numel() > 0:
+                        pick = fg_idx[torch.randint(0, fg_idx.shape[0], (1,)).item()]
+                        cy, cx = int(pick[0].item()), int(pick[1].item())
+                        top = max(0, min(h - cs, cy - cs // 2))
+                        left = max(0, min(w - cs, cx - cs // 2))
+                    else:
+                        top = int(torch.randint(0, h - cs + 1, (1,)).item())
+                        left = int(torch.randint(0, w - cs + 1, (1,)).item())
+                else:
+                    top = int(torch.randint(0, h - cs + 1, (1,)).item())
+                    left = int(torch.randint(0, w - cs + 1, (1,)).item())
+                x = x[:, top:top + cs, left:left + cs]
+                y = y[top:top + cs, left:left + cs]
+
+        return x, y
+
+
+class FeatureNormalizeDataset(Dataset):
+    """Apply fixed channel-wise normalization to features in a dataset."""
+
+    def __init__(self, base_dataset: Dataset, mean: torch.Tensor, std: torch.Tensor):
+        self.base_dataset = base_dataset
+        self.mean = mean.view(-1, 1, 1)
+        self.std = std.view(-1, 1, 1)
+
+    def __len__(self) -> int:
+        return len(self.base_dataset)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        x, y = self.base_dataset[idx]
+        x = (x - self.mean) / self.std
+        return x, y
+
+
+def estimate_feature_channel_stats(dataset: Dataset, max_samples: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
+    """Estimate channel-wise mean/std on training features only.
+
+    max_samples=0 means use all samples.
+    """
+    n = len(dataset)
+    if n == 0:
+        raise ValueError("Cannot estimate feature stats from empty dataset")
+
+    if max_samples > 0:
+        n = min(n, int(max_samples))
+
+    sum_c = None
+    sumsq_c = None
+    count = 0
+
+    for i in range(n):
+        x, _ = dataset[i]  # (C,H,W)
+        x = x.float()
+        c = x.shape[0]
+        flat = x.view(c, -1)
+        s = flat.sum(dim=1)
+        ss = (flat * flat).sum(dim=1)
+        if sum_c is None:
+            sum_c = s
+            sumsq_c = ss
+        else:
+            sum_c = sum_c + s
+            sumsq_c = sumsq_c + ss
+        count += flat.shape[1]
+
+    assert sum_c is not None and sumsq_c is not None
+    mean = sum_c / max(1, count)
+    var = (sumsq_c / max(1, count)) - mean * mean
+    std = torch.sqrt(torch.clamp(var, min=1e-6))
+    return mean, std
+
+
+def estimate_sample_foreground_ratios(
+    dataset: Dataset,
+    background_index: int,
+    ignore_index: int,
+) -> np.ndarray:
+    """Estimate per-sample foreground ratio for curriculum warmup."""
+    ratios = []
+    for i in range(len(dataset)):
+        _x, y = dataset[i]
+        valid = y != ignore_index
+        denom = int(valid.sum().item())
+        if denom <= 0:
+            ratios.append(0.0)
+            continue
+        fg = ((y != background_index) & valid).sum().item()
+        ratios.append(float(fg) / float(denom))
+    return np.asarray(ratios, dtype=np.float32)
+
+
 # ---------- Simple U-Net implementation ----------
 
 
 class DoubleConv(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int):
+    def __init__(self, in_ch: int, out_ch: int, norm: str = "group"):
         super().__init__()
+        if norm == "batch":
+            norm1 = nn.BatchNorm2d(out_ch)
+            norm2 = nn.BatchNorm2d(out_ch)
+        else:
+            # GroupNorm is more stable than BatchNorm for small/imbalanced batches.
+            g = 8 if out_ch % 8 == 0 else 4 if out_ch % 4 == 0 else 1
+            norm1 = nn.GroupNorm(g, out_ch)
+            norm2 = nn.GroupNorm(g, out_ch)
         self.net = nn.Sequential(
             nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1),
-            nn.BatchNorm2d(out_ch),
+            norm1,
             nn.ReLU(inplace=True),
             nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1),
-            nn.BatchNorm2d(out_ch),
+            norm2,
             nn.ReLU(inplace=True),
         )
 
@@ -170,24 +366,84 @@ class DoubleConv(nn.Module):
         return self.net(x)
 
 
-class UNet(nn.Module):
-    def __init__(self, in_channels: int, num_classes: int = 20, base_ch: int = 32):
+def _make_norm(norm: str, channels: int) -> nn.Module:
+    if norm == "batch":
+        return nn.BatchNorm2d(channels)
+    g = 8 if channels % 8 == 0 else 4 if channels % 4 == 0 else 1
+    return nn.GroupNorm(g, channels)
+
+
+class SEBlock(nn.Module):
+    def __init__(self, channels: int, reduction: int = 8):
         super().__init__()
-        self.enc1 = DoubleConv(in_channels, base_ch)
+        hidden = max(8, channels // reduction)
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Conv2d(channels, hidden, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden, channels, kernel_size=1),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        scale = self.fc(self.pool(x))
+        return x * scale
+
+
+class ResidualSEBlock(nn.Module):
+    def __init__(self, in_ch: int, out_ch: int, norm: str = "group", dropout: float = 0.0):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1, bias=False)
+        self.norm1 = _make_norm(norm, out_ch)
+        self.conv2 = nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1, bias=False)
+        self.norm2 = _make_norm(norm, out_ch)
+        self.shortcut = nn.Identity() if in_ch == out_ch else nn.Conv2d(in_ch, out_ch, kernel_size=1, bias=False)
+        self.se = SEBlock(out_ch)
+        self.dropout = nn.Dropout2d(dropout) if dropout > 0 else nn.Identity()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = self.shortcut(x)
+        x = torch.relu(self.norm1(self.conv1(x)))
+        x = self.norm2(self.conv2(x))
+        x = torch.relu(x + residual)
+        x = self.se(x)
+        return self.dropout(x)
+
+
+class AttentionGate(nn.Module):
+    def __init__(self, skip_ch: int, gate_ch: int, inter_ch: int):
+        super().__init__()
+        self.theta = nn.Conv2d(skip_ch, inter_ch, kernel_size=1, bias=False)
+        self.phi = nn.Conv2d(gate_ch, inter_ch, kernel_size=1, bias=False)
+        self.psi = nn.Conv2d(inter_ch, 1, kernel_size=1, bias=True)
+
+    def forward(self, skip: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+        alpha = torch.sigmoid(self.psi(torch.relu(self.theta(skip) + self.phi(gate))))
+        return skip * alpha
+
+
+class UNet(nn.Module):
+    def __init__(self, in_channels: int, num_classes: int = 20, base_ch: int = 32, norm: str = "group"):
+        super().__init__()
+        self.enc1 = DoubleConv(in_channels, base_ch, norm=norm)
         self.pool1 = nn.MaxPool2d(2)
-        self.enc2 = DoubleConv(base_ch, base_ch * 2)
+        self.enc2 = DoubleConv(base_ch, base_ch * 2, norm=norm)
         self.pool2 = nn.MaxPool2d(2)
-        self.enc3 = DoubleConv(base_ch * 2, base_ch * 4)
+        self.enc3 = DoubleConv(base_ch * 2, base_ch * 4, norm=norm)
         self.pool3 = nn.MaxPool2d(2)
+        self.enc4 = DoubleConv(base_ch * 4, base_ch * 8, norm=norm)
+        self.pool4 = nn.MaxPool2d(2)
 
-        self.bottleneck = DoubleConv(base_ch * 4, base_ch * 8)
+        self.bottleneck = DoubleConv(base_ch * 8, base_ch * 16, norm=norm)
 
+        self.up4 = nn.ConvTranspose2d(base_ch * 16, base_ch * 8, kernel_size=2, stride=2)
+        self.dec4 = DoubleConv(base_ch * 16, base_ch * 8, norm=norm)
         self.up3 = nn.ConvTranspose2d(base_ch * 8, base_ch * 4, kernel_size=2, stride=2)
-        self.dec3 = DoubleConv(base_ch * 8, base_ch * 4)
+        self.dec3 = DoubleConv(base_ch * 8, base_ch * 4, norm=norm)
         self.up2 = nn.ConvTranspose2d(base_ch * 4, base_ch * 2, kernel_size=2, stride=2)
-        self.dec2 = DoubleConv(base_ch * 4, base_ch * 2)
+        self.dec2 = DoubleConv(base_ch * 4, base_ch * 2, norm=norm)
         self.up1 = nn.ConvTranspose2d(base_ch * 2, base_ch, kernel_size=2, stride=2)
-        self.dec1 = DoubleConv(base_ch * 2, base_ch)
+        self.dec1 = DoubleConv(base_ch * 2, base_ch, norm=norm)
 
         self.out_conv = nn.Conv2d(base_ch, num_classes, kernel_size=1)
 
@@ -196,10 +452,15 @@ class UNet(nn.Module):
         x1 = self.enc1(x)
         x2 = self.enc2(self.pool1(x1))
         x3 = self.enc3(self.pool2(x2))
-        xb = self.bottleneck(self.pool3(x3))
+        x4 = self.enc4(self.pool3(x3))
+        xb = self.bottleneck(self.pool4(x4))
 
         # Decoder with skip connections
-        x = self.up3(xb)
+        x = self.up4(xb)
+        x = torch.cat([x4, x], dim=1)
+        x = self.dec4(x)
+
+        x = self.up3(x)
         x = torch.cat([x3, x], dim=1)
         x = self.dec3(x)
 
@@ -214,10 +475,485 @@ class UNet(nn.Module):
         return self.out_conv(x)
 
 
+class UNetDeep(nn.Module):
+    """Deeper U-Net with one additional down/up stage.
+
+    Channels become:
+      base, 2*base, 4*base, 8*base, 16*base, bottleneck=32*base
+    """
+
+    def __init__(self, in_channels: int, num_classes: int = 20, base_ch: int = 32, norm: str = "group"):
+        super().__init__()
+        self.enc1 = DoubleConv(in_channels, base_ch, norm=norm)
+        self.pool1 = nn.MaxPool2d(2)
+        self.enc2 = DoubleConv(base_ch, base_ch * 2, norm=norm)
+        self.pool2 = nn.MaxPool2d(2)
+        self.enc3 = DoubleConv(base_ch * 2, base_ch * 4, norm=norm)
+        self.pool3 = nn.MaxPool2d(2)
+        self.enc4 = DoubleConv(base_ch * 4, base_ch * 8, norm=norm)
+        self.pool4 = nn.MaxPool2d(2)
+        self.enc5 = DoubleConv(base_ch * 8, base_ch * 16, norm=norm)
+        self.pool5 = nn.MaxPool2d(2)
+
+        self.bottleneck = DoubleConv(base_ch * 16, base_ch * 32, norm=norm)
+
+        self.up5 = nn.ConvTranspose2d(base_ch * 32, base_ch * 16, kernel_size=2, stride=2)
+        self.dec5 = DoubleConv(base_ch * 32, base_ch * 16, norm=norm)
+        self.up4 = nn.ConvTranspose2d(base_ch * 16, base_ch * 8, kernel_size=2, stride=2)
+        self.dec4 = DoubleConv(base_ch * 16, base_ch * 8, norm=norm)
+        self.up3 = nn.ConvTranspose2d(base_ch * 8, base_ch * 4, kernel_size=2, stride=2)
+        self.dec3 = DoubleConv(base_ch * 8, base_ch * 4, norm=norm)
+        self.up2 = nn.ConvTranspose2d(base_ch * 4, base_ch * 2, kernel_size=2, stride=2)
+        self.dec2 = DoubleConv(base_ch * 4, base_ch * 2, norm=norm)
+        self.up1 = nn.ConvTranspose2d(base_ch * 2, base_ch, kernel_size=2, stride=2)
+        self.dec1 = DoubleConv(base_ch * 2, base_ch, norm=norm)
+
+        self.out_conv = nn.Conv2d(base_ch, num_classes, kernel_size=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x1 = self.enc1(x)
+        x2 = self.enc2(self.pool1(x1))
+        x3 = self.enc3(self.pool2(x2))
+        x4 = self.enc4(self.pool3(x3))
+        x5 = self.enc5(self.pool4(x4))
+        xb = self.bottleneck(self.pool5(x5))
+
+        x = self.up5(xb)
+        x = torch.cat([x5, x], dim=1)
+        x = self.dec5(x)
+
+        x = self.up4(x)
+        x = torch.cat([x4, x], dim=1)
+        x = self.dec4(x)
+
+        x = self.up3(x)
+        x = torch.cat([x3, x], dim=1)
+        x = self.dec3(x)
+
+        x = self.up2(x)
+        x = torch.cat([x2, x], dim=1)
+        x = self.dec2(x)
+
+        x = self.up1(x)
+        x = torch.cat([x1, x], dim=1)
+        x = self.dec1(x)
+
+        return self.out_conv(x)
+
+
+class UNetResSE(nn.Module):
+    """UNet variant with residual+SE blocks and attention-gated skip connections."""
+
+    def __init__(
+        self,
+        in_channels: int,
+        num_classes: int = 20,
+        base_ch: int = 32,
+        norm: str = "group",
+        depth: int = 4,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        if depth not in (4, 5):
+            raise ValueError(f"UNetResSE supports depth 4 or 5, got {depth}")
+
+        enc_channels = [base_ch, base_ch * 2, base_ch * 4, base_ch * 8]
+        if depth == 5:
+            enc_channels.append(base_ch * 16)
+
+        self.enc_blocks = nn.ModuleList()
+        self.pools = nn.ModuleList()
+        in_ch = in_channels
+        for c in enc_channels:
+            self.enc_blocks.append(ResidualSEBlock(in_ch, c, norm=norm, dropout=dropout * 0.5))
+            self.pools.append(nn.MaxPool2d(2))
+            in_ch = c
+
+        bottleneck_ch = enc_channels[-1] * 2
+        self.bottleneck = ResidualSEBlock(enc_channels[-1], bottleneck_ch, norm=norm, dropout=dropout)
+
+        self.upconvs = nn.ModuleList()
+        self.attn_gates = nn.ModuleList()
+        self.dec_blocks = nn.ModuleList()
+
+        cur_ch = bottleneck_ch
+        for skip_ch in reversed(enc_channels):
+            self.upconvs.append(nn.ConvTranspose2d(cur_ch, skip_ch, kernel_size=2, stride=2))
+            inter_ch = max(skip_ch // 2, 8)
+            self.attn_gates.append(AttentionGate(skip_ch=skip_ch, gate_ch=skip_ch, inter_ch=inter_ch))
+            self.dec_blocks.append(ResidualSEBlock(skip_ch * 2, skip_ch, norm=norm, dropout=dropout * 0.5))
+            cur_ch = skip_ch
+
+        self.out_conv = nn.Conv2d(cur_ch, num_classes, kernel_size=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        skips = []
+        for block, pool in zip(self.enc_blocks, self.pools):
+            x = block(x)
+            skips.append(x)
+            x = pool(x)
+
+        x = self.bottleneck(x)
+
+        for up, attn, dec, skip in zip(self.upconvs, self.attn_gates, self.dec_blocks, reversed(skips)):
+            x = up(x)
+            skip = attn(skip, x)
+            x = torch.cat([skip, x], dim=1)
+            x = dec(x)
+
+        return self.out_conv(x)
+
+
+class ASPP(nn.Module):
+    def __init__(self, in_ch: int, out_ch: int, norm: str = "group"):
+        super().__init__()
+        rates = [1, 6, 12, 18]
+        self.branches = nn.ModuleList()
+        for r in rates:
+            if r == 1:
+                self.branches.append(
+                    nn.Sequential(
+                        nn.Conv2d(in_ch, out_ch, kernel_size=1, bias=False),
+                        _make_norm(norm, out_ch),
+                        nn.ReLU(inplace=True),
+                    )
+                )
+            else:
+                self.branches.append(
+                    nn.Sequential(
+                        nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=r, dilation=r, bias=False),
+                        _make_norm(norm, out_ch),
+                        nn.ReLU(inplace=True),
+                    )
+                )
+
+        self.image_pool = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(in_ch, out_ch, kernel_size=1, bias=False),
+            _make_norm(norm, out_ch),
+            nn.ReLU(inplace=True),
+        )
+
+        self.project = nn.Sequential(
+            nn.Conv2d(out_ch * (len(rates) + 1), out_ch, kernel_size=1, bias=False),
+            _make_norm(norm, out_ch),
+            nn.ReLU(inplace=True),
+            nn.Dropout2d(0.1),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        feats = [b(x) for b in self.branches]
+        img = self.image_pool(x)
+        img = nn.functional.interpolate(img, size=x.shape[-2:], mode="bilinear", align_corners=False)
+        feats.append(img)
+        x = torch.cat(feats, dim=1)
+        return self.project(x)
+
+
+class DeepLabLite(nn.Module):
+    """DeepLabV3+-style lightweight head for embedding segmentation."""
+
+    def __init__(self, in_channels: int, num_classes: int = 20, base_ch: int = 32, norm: str = "group"):
+        super().__init__()
+        self.stem = ResidualSEBlock(in_channels, base_ch, norm=norm, dropout=0.0)
+        self.down1 = nn.Sequential(nn.MaxPool2d(2), ResidualSEBlock(base_ch, base_ch * 2, norm=norm, dropout=0.05))
+        self.down2 = nn.Sequential(nn.MaxPool2d(2), ResidualSEBlock(base_ch * 2, base_ch * 4, norm=norm, dropout=0.05))
+        self.down3 = nn.Sequential(nn.MaxPool2d(2), ResidualSEBlock(base_ch * 4, base_ch * 8, norm=norm, dropout=0.1))
+
+        self.aspp = ASPP(base_ch * 8, base_ch * 4, norm=norm)
+
+        self.low_proj = nn.Sequential(
+            nn.Conv2d(base_ch, base_ch, kernel_size=1, bias=False),
+            _make_norm(norm, base_ch),
+            nn.ReLU(inplace=True),
+        )
+        self.fuse = nn.Sequential(
+            nn.Conv2d(base_ch * 5, base_ch * 2, kernel_size=3, padding=1, bias=False),
+            _make_norm(norm, base_ch * 2),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(base_ch * 2, base_ch * 2, kernel_size=3, padding=1, bias=False),
+            _make_norm(norm, base_ch * 2),
+            nn.ReLU(inplace=True),
+        )
+        self.out_conv = nn.Conv2d(base_ch * 2, num_classes, kernel_size=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h, w = x.shape[-2:]
+        low = self.stem(x)                 # H,W
+        x = self.down1(low)                # H/2,W/2
+        x = self.down2(x)                  # H/4,W/4
+        x = self.down3(x)                  # H/8,W/8
+        x = self.aspp(x)                   # H/8,W/8
+
+        x = nn.functional.interpolate(x, size=low.shape[-2:], mode="bilinear", align_corners=False)
+        low = self.low_proj(low)
+        x = torch.cat([x, low], dim=1)
+        x = self.fuse(x)
+        x = self.out_conv(x)
+        x = nn.functional.interpolate(x, size=(h, w), mode="bilinear", align_corners=False)
+        return x
+
+
+class SoftDiceLoss(nn.Module):
+    def __init__(
+        self,
+        num_classes: int,
+        ignore_index: int = 19,
+        eps: float = 1e-6,
+        background_index: int = 0,
+        ignore_background: bool = True,
+    ):
+        super().__init__()
+        self.num_classes = num_classes
+        self.ignore_index = ignore_index
+        self.eps = eps
+        self.background_index = background_index
+        self.ignore_background = ignore_background
+
+    def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        probs = torch.softmax(logits, dim=1)  # (B,C,H,W)
+        valid_mask = (target != self.ignore_index).float()  # (B,H,W)
+
+        losses = []
+        for cls in range(self.num_classes):
+            if cls == self.ignore_index:
+                continue
+            if self.ignore_background and cls == self.background_index:
+                continue
+            tgt = (target == cls).float()
+            # Skip classes absent in this batch to avoid noisy gradients on long-tail labels.
+            if tgt.sum().item() <= 0:
+                continue
+            p = probs[:, cls, :, :] * valid_mask
+            t = tgt * valid_mask
+            inter = (p * t).sum()
+            denom = (p * p).sum() + (t * t).sum()
+            dice = (2.0 * inter + self.eps) / (denom + self.eps)
+            losses.append(1.0 - dice)
+
+        if not losses:
+            return logits.new_tensor(0.0)
+        return torch.stack(losses).mean()
+
+
+def foreground_aux_loss(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    background_index: int,
+    ignore_index: int,
+) -> torch.Tensor:
+    """Binary foreground loss from multi-class probabilities.
+
+    Encourages the model to separate foreground vs background first, which helps
+    avoid early collapse to all-background predictions.
+    """
+    probs = torch.softmax(logits, dim=1)
+    n_classes = probs.shape[1]
+    fg_classes = [c for c in range(n_classes) if c not in (background_index, ignore_index)]
+    if not fg_classes:
+        return logits.new_tensor(0.0)
+
+    fg_prob = probs[:, fg_classes, :, :].sum(dim=1).clamp(1e-6, 1.0 - 1e-6)
+    valid = (target != ignore_index)
+    fg_tgt = ((target != background_index) & valid).float()
+
+    bce = -(fg_tgt * torch.log(fg_prob) + (1.0 - fg_tgt) * torch.log(1.0 - fg_prob))
+    denom = valid.float().sum().clamp_min(1.0)
+    return (bce * valid.float()).sum() / denom
+
+
+def background_ratio_loss(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    background_index: int,
+    ignore_index: int,
+) -> torch.Tensor:
+    """Match predicted background probability ratio to label background ratio."""
+    probs_bg = torch.softmax(logits, dim=1)[:, background_index, :, :]
+    valid = (target != ignore_index).float()
+    denom = valid.sum().clamp_min(1.0)
+
+    pred_bg_ratio = (probs_bg * valid).sum() / denom
+    true_bg_ratio = (((target == background_index).float()) * valid).sum() / denom
+    return (pred_bg_ratio - true_bg_ratio).pow(2)
+
+
+def estimate_class_weights(
+    dataset,
+    num_classes: int,
+    ignore_index: int,
+    min_weight: float = 0.2,
+    max_weight: float = 5.0,
+) -> torch.Tensor:
+    """Estimate inverse-frequency class weights from training subset labels."""
+    counts = torch.zeros(num_classes, dtype=torch.float64)
+    loader = DataLoader(dataset, batch_size=1, shuffle=False)
+
+    for _x, y in loader:
+        y_flat = y.view(-1)
+        valid = y_flat != ignore_index
+        if valid.any():
+            binc = torch.bincount(y_flat[valid], minlength=num_classes).to(torch.float64)
+            counts += binc
+
+    present = counts > 0
+    weights = torch.zeros(num_classes, dtype=torch.float32)
+    if present.any():
+        total = counts[present].sum()
+        weights[present] = (total / counts[present]).to(torch.float32)
+        # Normalize so average weight over present classes is ~1
+        weights[present] = weights[present] / weights[present].mean().clamp_min(1e-6)
+        weights[present] = weights[present].clamp(min=min_weight, max=max_weight)
+
+    if 0 <= ignore_index < num_classes:
+        weights[ignore_index] = 0.0
+
+    return weights
+
+
+def compute_segmentation_metrics(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    num_classes: int,
+    ignore_index: int,
+    background_index: int = 0,
+    ignore_background: bool = True,
+) -> tuple[float, float]:
+    """Return (pixel_acc, mean_iou) on valid pixels."""
+    preds = logits.argmax(dim=1)
+    mask = target != ignore_index
+    valid = int(mask.sum().item())
+    if valid == 0:
+        return 0.0, 0.0
+
+    pixel_acc = float((preds[mask] == target[mask]).sum().item()) / float(valid)
+
+    ious: List[float] = []
+    for cls in range(num_classes):
+        if cls == ignore_index:
+            continue
+        if ignore_background and cls == background_index:
+            continue
+        p = (preds == cls) & mask
+        t = (target == cls) & mask
+        inter = (p & t).sum().item()
+        union = (p | t).sum().item()
+        if union > 0:
+            ious.append(float(inter) / float(union))
+
+    miou = float(np.mean(ious)) if ious else 0.0
+    return pixel_acc, miou
+
+
+def labels_to_rgb(mask: np.ndarray, num_classes: int, ignore_index: int) -> np.ndarray:
+    cmap = plt.get_cmap("tab20", num_classes)
+    palette = cmap(np.arange(num_classes))[:, :3]
+    safe_mask = np.clip(mask, 0, num_classes - 1)
+    rgb = palette[safe_mask]
+    if 0 <= ignore_index < num_classes:
+        rgb[mask == ignore_index] = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+    return rgb
+
+
+def save_val_visualizations(
+    model: nn.Module,
+    val_ds,
+    device: torch.device,
+    output_dir: Path,
+    num_classes: int,
+    ignore_index: int,
+    max_images: int = 4,
+) -> None:
+    if val_ds is None or len(val_ds) == 0 or max_images <= 0:
+        return
+
+    vis_dir = output_dir / "val_visualizations"
+    vis_dir.mkdir(parents=True, exist_ok=True)
+
+    model.eval()
+    n = min(max_images, len(val_ds))
+    with torch.no_grad():
+        for i in range(n):
+            x, y = val_ds[i]
+            logits = model(x.unsqueeze(0).to(device))
+            pred = logits.argmax(dim=1).squeeze(0).cpu().numpy().astype(np.int64)
+
+            x_np = x.cpu().numpy()
+            rgb = x_np[:3] if x_np.shape[0] >= 3 else np.repeat(x_np[:1], 3, axis=0)
+            rgb = np.transpose(rgb, (1, 2, 0))
+            rgb = (rgb - rgb.min()) / (rgb.max() - rgb.min() + 1e-6)
+
+            y_np = y.cpu().numpy().astype(np.int64)
+            y_rgb = labels_to_rgb(y_np, num_classes=num_classes, ignore_index=ignore_index)
+            p_rgb = labels_to_rgb(pred, num_classes=num_classes, ignore_index=ignore_index)
+
+            fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+            axes[0].imshow(rgb)
+            axes[0].set_title("Input (first 3 channels)")
+            axes[0].axis("off")
+
+            axes[1].imshow(y_rgb)
+            axes[1].set_title("Ground Truth")
+            axes[1].axis("off")
+
+            axes[2].imshow(p_rgb)
+            axes[2].set_title("Prediction")
+            axes[2].axis("off")
+
+            plt.tight_layout()
+            fig.savefig(vis_dir / f"val_sample_{i:02d}.png", dpi=150)
+            plt.close(fig)
+
+
+def load_unet_checkpoint(model: nn.Module, checkpoint_path: Path, device: torch.device, strict: bool = True) -> None:
+    """Load a saved UNet checkpoint for fine-tuning."""
+    ckpt = torch.load(checkpoint_path, map_location=device)
+    state_dict = ckpt["model_state_dict"] if isinstance(ckpt, dict) and "model_state_dict" in ckpt else ckpt
+    if strict:
+        missing, unexpected = model.load_state_dict(state_dict, strict=True)
+        print(f"Loaded checkpoint (strict) from {checkpoint_path}")
+        if missing:
+            print(f"Missing keys ({len(missing)}): {missing[:10]}")
+        if unexpected:
+            print(f"Unexpected keys ({len(unexpected)}): {unexpected[:10]}")
+        return
+
+    model_state = model.state_dict()
+    filtered_state = {}
+    skipped_mismatch = []
+    for k, v in state_dict.items():
+        if k not in model_state:
+            continue
+        if model_state[k].shape != v.shape:
+            skipped_mismatch.append((k, tuple(v.shape), tuple(model_state[k].shape)))
+            continue
+        filtered_state[k] = v
+
+    missing, unexpected = model.load_state_dict(filtered_state, strict=False)
+    print(
+        f"Loaded checkpoint (non-strict, shape-filtered) from {checkpoint_path} "
+        f"with {len(filtered_state)}/{len(model_state)} compatible tensor(s)."
+    )
+    if skipped_mismatch:
+        print(
+            f"Skipped shape-mismatched keys ({len(skipped_mismatch)}), "
+            f"example: {skipped_mismatch[:3]}"
+        )
+    if missing:
+        print(f"Missing keys after filtered load ({len(missing)}): {missing[:10]}")
+    if unexpected:
+        print(f"Unexpected keys ({len(unexpected)}): {unexpected[:10]}")
+
+
 # ---------- Training script ----------
 
 
 def train(args: argparse.Namespace) -> None:
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
 
     emb_path = Path(args.embeddings_path)
@@ -227,10 +963,21 @@ def train(args: argparse.Namespace) -> None:
     if not labels_path.exists():
         raise FileNotFoundError(f"Labels file not found: {labels_path}")
 
+    # Auto-switch to per-patch label mode when labels_path is a directory.
+    # This matches datasets organized as:
+    #   embedding_<id>.npz <-> ParcelIDs_<id>_labels.npz
+    per_patch_labels = bool(args.per_patch_labels or labels_path.is_dir())
+    if labels_path.is_dir() and not args.per_patch_labels:
+        print(
+            "Detected labels directory; enabling per-patch label matching automatically "
+            "(equivalent to --per_patch_labels)."
+        )
+
     full_dataset = EmbeddingSegmentationDataset(
         emb_path,
         labels_path,
-        per_patch_labels=args.per_patch_labels,
+        per_patch_labels=per_patch_labels,
+        embedding_key=args.embedding_key,
     )
 
     # Peek at one sample to infer channel and spatial sizes.
@@ -247,78 +994,352 @@ def train(args: argparse.Namespace) -> None:
     train_idx = indices[:n_train]
     val_idx = indices[n_train:] if n_val > 0 else np.array([], dtype=int)
 
-    train_ds = Subset(full_dataset, train_idx.tolist())
-    val_ds = Subset(full_dataset, val_idx.tolist()) if n_val > 0 else None
+    raw_base_train_ds = Subset(full_dataset, train_idx.tolist())
+    base_train_ds = raw_base_train_ds
+    base_val_ds = Subset(full_dataset, val_idx.tolist()) if n_val > 0 else None
+
+    if args.normalize_features == 1 and len(base_train_ds) > 0:
+        feat_mean, feat_std = estimate_feature_channel_stats(
+            base_train_ds,
+            max_samples=args.feature_stats_max_samples,
+        )
+        print(
+            "Feature normalization: ON "
+            f"(mean range [{feat_mean.min().item():.4f}, {feat_mean.max().item():.4f}], "
+            f"std range [{feat_std.min().item():.4f}, {feat_std.max().item():.4f}])"
+        )
+        base_train_ds = FeatureNormalizeDataset(base_train_ds, feat_mean, feat_std)
+        if base_val_ds is not None:
+            base_val_ds = FeatureNormalizeDataset(base_val_ds, feat_mean, feat_std)
+    else:
+        print("Feature normalization: OFF")
+
+    train_ds = base_train_ds
+    val_ds = base_val_ds
+
+    if args.enable_augmentation == 1 and len(base_train_ds) > 0:
+        train_ds = AugmentedTrainDataset(
+            base_dataset=base_train_ds,
+            repeat_factor=args.train_repeat_factor,
+            flip_prob=args.aug_flip_prob,
+            rot90_prob=args.aug_rot90_prob,
+            noise_std=args.aug_noise_std,
+            gain_std=args.aug_gain_std,
+            crop_size=args.train_crop_size,
+            foreground_crop_prob=args.fg_crop_prob,
+            background_index=args.background_index,
+            ignore_index=args.ignore_index,
+        )
 
     print(f"Train samples: {len(train_ds)}, Val samples: {len(val_ds) if val_ds is not None else 0}")
+    if args.enable_augmentation == 1:
+        print(
+            "Train augmentation: ON "
+            f"(repeat={args.train_repeat_factor}, flip_prob={args.aug_flip_prob}, "
+            f"rot90_prob={args.aug_rot90_prob}, noise_std={args.aug_noise_std}, "
+            f"gain_std={args.aug_gain_std}, crop_size={args.train_crop_size}, "
+            f"fg_crop_prob={args.fg_crop_prob})"
+        )
+    else:
+        print("Train augmentation: OFF")
 
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
-    val_loader = (
-        DataLoader(val_ds, batch_size=args.batch_size, shuffle=False) if val_ds is not None else None
+    train_sampler = None
+    if args.use_fg_sampler == 1 and len(raw_base_train_ds) > 0:
+        fg_ratios = estimate_sample_foreground_ratios(
+            raw_base_train_ds,
+            background_index=args.background_index,
+            ignore_index=args.ignore_index,
+        )
+        weights = args.fg_sampler_min_weight + np.power(
+            np.clip(fg_ratios, 1e-6, None),
+            args.fg_sampler_power,
+        )
+        if len(train_ds) != len(raw_base_train_ds):
+            rep = int(np.ceil(len(train_ds) / len(raw_base_train_ds)))
+            weights = np.tile(weights, rep)[:len(train_ds)]
+        weights_t = torch.as_tensor(weights, dtype=torch.double)
+        train_sampler = WeightedRandomSampler(
+            weights=weights_t,
+            num_samples=len(train_ds),
+            replacement=True,
+        )
+        print(
+            f"Foreground sampler: ON (power={args.fg_sampler_power}, min_weight={args.fg_sampler_min_weight})"
+        )
+    else:
+        print("Foreground sampler: OFF")
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=args.batch_size,
+        shuffle=train_sampler is None,
+        sampler=train_sampler,
+        num_workers=args.num_workers,
+        pin_memory=device.type == "cuda",
     )
 
-    model = UNet(in_channels=C, num_classes=args.num_classes, base_ch=args.base_channels)
+    warmup_loader = None
+    if args.warmup_epochs > 0 and len(raw_base_train_ds) > 1:
+        fg_ratios = estimate_sample_foreground_ratios(
+            raw_base_train_ds,
+            background_index=args.background_index,
+            ignore_index=args.ignore_index,
+        )
+        k = max(1, int(len(raw_base_train_ds) * args.warmup_top_fg_fraction))
+        top_local = np.argsort(-fg_ratios)[:k]
+        # Map local subset indices back to full_dataset indices.
+        warmup_global_idx = train_idx[top_local]
+        warmup_raw_ds = Subset(full_dataset, warmup_global_idx.tolist())
+        warmup_ds = warmup_raw_ds
+        if args.normalize_features == 1 and len(base_train_ds) > 0:
+            warmup_ds = FeatureNormalizeDataset(warmup_raw_ds, feat_mean, feat_std)
+        warmup_loader = DataLoader(
+            warmup_ds,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=args.num_workers,
+            pin_memory=device.type == "cuda",
+        )
+        print(
+            f"Warmup curriculum: ON (epochs={args.warmup_epochs}, top_fg_fraction={args.warmup_top_fg_fraction}, "
+            f"warmup_samples={len(warmup_ds)})"
+        )
+    else:
+        print("Warmup curriculum: OFF")
+    val_loader = (
+        DataLoader(
+            val_ds,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=device.type == "cuda",
+        )
+        if val_ds is not None
+        else None
+    )
+
+    if args.model_variant == "resse":
+        model = UNetResSE(
+            in_channels=C,
+            num_classes=args.num_classes,
+            base_ch=args.base_channels,
+            norm=args.norm_type,
+            depth=args.unet_depth,
+            dropout=args.dropout_rate,
+        )
+        print(
+            f"Model: UNetResSE(depth={args.unet_depth}, base_channels={args.base_channels}, "
+            f"dropout={args.dropout_rate})"
+        )
+    elif args.model_variant == "aspp":
+        model = DeepLabLite(
+            in_channels=C,
+            num_classes=args.num_classes,
+            base_ch=args.base_channels,
+            norm=args.norm_type,
+        )
+        print(f"Model: DeepLabLite(base_channels={args.base_channels})")
+    else:
+        if args.unet_depth == 5:
+            model = UNetDeep(
+                in_channels=C,
+                num_classes=args.num_classes,
+                base_ch=args.base_channels,
+                norm=args.norm_type,
+            )
+            print(f"Model: UNetDeep(depth=5, base_channels={args.base_channels})")
+        else:
+            model = UNet(
+                in_channels=C,
+                num_classes=args.num_classes,
+                base_ch=args.base_channels,
+                norm=args.norm_type,
+            )
+            print(f"Model: UNet(depth=4, base_channels={args.base_channels})")
     model.to(device)
 
-    # Void label (19) is treated as ignore_index by default
-    criterion = nn.CrossEntropyLoss(ignore_index=args.ignore_index)
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    if args.resume_checkpoint:
+        ckpt_path = Path(args.resume_checkpoint)
+        if not ckpt_path.exists():
+            raise FileNotFoundError(f"Resume checkpoint not found: {ckpt_path}")
+        load_unet_checkpoint(
+            model,
+            checkpoint_path=ckpt_path,
+            device=device,
+            strict=bool(args.resume_strict),
+        )
+
+    # Weighted CE + Dice is more robust under class imbalance.
+    class_weights = estimate_class_weights(
+        base_train_ds,
+        args.num_classes,
+        args.ignore_index,
+        min_weight=args.class_weight_min,
+        max_weight=args.class_weight_max,
+    ).to(device)
+    if 0 <= args.background_index < args.num_classes and args.background_ce_weight >= 0:
+        class_weights[args.background_index] = min(
+            class_weights[args.background_index].item(),
+            float(args.background_ce_weight),
+        )
+    criterion_ce = nn.CrossEntropyLoss(
+        ignore_index=args.ignore_index,
+        weight=class_weights,
+        label_smoothing=args.label_smoothing,
+    )
+    criterion_dice = SoftDiceLoss(
+        num_classes=args.num_classes,
+        ignore_index=args.ignore_index,
+        background_index=args.background_index,
+        ignore_background=args.ignore_background_in_dice,
+    )
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scheduler_mode = "max" if args.scheduler_monitor == "val_miou" else "min"
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode=scheduler_mode,
+        factor=args.lr_decay_factor,
+        patience=args.lr_patience,
+        min_lr=args.min_lr,
+    )
+
+    print("Estimated class weights:", class_weights.detach().cpu().numpy().round(4).tolist())
 
     best_val_loss = float("inf")
     best_val_acc = 0.0
+    best_val_miou = 0.0
     best_state = None
+    epochs_no_improve = 0
 
     for epoch in range(args.epochs):
         model.train()
+        # Warm up auxiliary constraints gradually to avoid harming early generalization.
+        fg_aux_scale = min(1.0, float(epoch + 1) / max(1, args.fg_aux_warmup_epochs))
+        bg_ratio_scale = min(1.0, float(epoch + 1) / max(1, args.bg_ratio_warmup_epochs))
+        eff_fg_aux_weight = args.fg_aux_weight * fg_aux_scale
+        eff_bg_ratio_weight = args.bg_ratio_weight * bg_ratio_scale
         running_loss = 0.0
         running_correct = 0
         running_total = 0
+        running_miou_sum = 0.0
+        running_miou_count = 0
+        running_pred_bg = 0
+        running_pred_total = 0
 
-        for x, y in train_loader:
+        active_loader = warmup_loader if (warmup_loader is not None and epoch < args.warmup_epochs) else train_loader
+        for x, y in active_loader:
             x = x.to(device)
             y = y.to(device)
 
             optimizer.zero_grad()
             logits = model(x)  # (B,num_classes,H,W)
-            loss = criterion(logits, y)
+            loss_ce = criterion_ce(logits, y)
+            loss_dice = criterion_dice(logits, y)
+            loss_fg = foreground_aux_loss(
+                logits,
+                y,
+                background_index=args.background_index,
+                ignore_index=args.ignore_index,
+            )
+            loss_bg_ratio = background_ratio_loss(
+                logits,
+                y,
+                background_index=args.background_index,
+                ignore_index=args.ignore_index,
+            )
+            loss = (
+                loss_ce
+                + args.dice_weight * loss_dice
+                + eff_fg_aux_weight * loss_fg
+                + eff_bg_ratio_weight * loss_bg_ratio
+            )
             loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
             running_loss += loss.item() * x.size(0)
 
             with torch.no_grad():
-                preds = logits.argmax(dim=1)
+                acc, miou = compute_segmentation_metrics(
+                    logits,
+                    y,
+                    num_classes=args.num_classes,
+                    ignore_index=args.ignore_index,
+                    background_index=args.background_index,
+                    ignore_background=args.ignore_background_in_metrics,
+                )
                 mask = y != args.ignore_index
-                correct = (preds[mask] == y[mask]).sum().item()
                 total = mask.sum().item()
-                running_correct += correct
+                running_correct += int(round(acc * total))
                 running_total += total
+                pred = logits.argmax(dim=1)
+                running_pred_bg += int(((pred == args.background_index) & mask).sum().item())
+                running_pred_total += int(total)
+                running_miou_sum += miou
+                running_miou_count += 1
 
-        train_loss = running_loss / max(1, len(train_ds))
+        train_loss = running_loss / max(1, len(active_loader.dataset))
         train_acc = running_correct / max(1, running_total) if running_total > 0 else 0.0
+        train_miou = running_miou_sum / max(1, running_miou_count)
+        train_pred_bg_ratio = running_pred_bg / max(1, running_pred_total)
 
         # Validation
         val_loss = None
         val_acc = None
+        val_miou = None
         if val_loader is not None:
             model.eval()
             val_running_loss = 0.0
             val_running_correct = 0
             val_running_total = 0
+            val_running_miou_sum = 0.0
+            val_running_miou_count = 0
+            val_running_pred_bg = 0
+            val_running_pred_total = 0
             with torch.no_grad():
                 for x, y in val_loader:
                     x = x.to(device)
                     y = y.to(device)
                     logits = model(x)
-                    loss = criterion(logits, y)
+                    loss_ce = criterion_ce(logits, y)
+                    loss_dice = criterion_dice(logits, y)
+                    loss_fg = foreground_aux_loss(
+                        logits,
+                        y,
+                        background_index=args.background_index,
+                        ignore_index=args.ignore_index,
+                    )
+                    loss_bg_ratio = background_ratio_loss(
+                        logits,
+                        y,
+                        background_index=args.background_index,
+                        ignore_index=args.ignore_index,
+                    )
+                    loss = (
+                        loss_ce
+                        + args.dice_weight * loss_dice
+                        + eff_fg_aux_weight * loss_fg
+                        + eff_bg_ratio_weight * loss_bg_ratio
+                    )
                     val_running_loss += loss.item() * x.size(0)
 
-                    preds = logits.argmax(dim=1)
+                    acc, miou = compute_segmentation_metrics(
+                        logits,
+                        y,
+                        num_classes=args.num_classes,
+                        ignore_index=args.ignore_index,
+                        background_index=args.background_index,
+                        ignore_background=args.ignore_background_in_metrics,
+                    )
                     mask = y != args.ignore_index
-                    correct = (preds[mask] == y[mask]).sum().item()
                     total = mask.sum().item()
-                    val_running_correct += correct
+                    val_running_correct += int(round(acc * total))
                     val_running_total += total
+                    pred = logits.argmax(dim=1)
+                    val_running_pred_bg += int(((pred == args.background_index) & mask).sum().item())
+                    val_running_pred_total += int(total)
+                    val_running_miou_sum += miou
+                    val_running_miou_count += 1
 
             val_loss = val_running_loss / max(1, len(val_ds))
             val_acc = (
@@ -326,27 +1347,55 @@ def train(args: argparse.Namespace) -> None:
                 if val_running_total > 0
                 else 0.0
             )
+            val_miou = val_running_miou_sum / max(1, val_running_miou_count)
+            val_pred_bg_ratio = val_running_pred_bg / max(1, val_running_pred_total)
 
-            # Track best model by validation loss (then accuracy as tie-breaker)
-            improved = val_loss < best_val_loss or (
-                np.isclose(val_loss, best_val_loss) and val_acc > best_val_acc
+            # Track best model by mIoU first, then val_loss as tie-breaker.
+            improved = (val_miou > best_val_miou) or (
+                np.isclose(val_miou, best_val_miou) and val_loss < best_val_loss
             )
             if improved:
                 best_val_loss = val_loss
                 best_val_acc = val_acc
+                best_val_miou = val_miou
                 best_state = model.state_dict()
+                epochs_no_improve = 0
+            else:
+                epochs_no_improve += 1
 
         if val_loss is not None:
             print(
                 f"Epoch {epoch+1}/{args.epochs} - "
-                f"train_loss: {train_loss:.4f}, train_acc: {train_acc:.4f}, "
-                f"val_loss: {val_loss:.4f}, val_acc: {val_acc:.4f}"
+                f"train_loss: {train_loss:.4f}, train_acc: {train_acc:.4f}, train_mIoU: {train_miou:.4f}, "
+                f"train_pred_bg: {train_pred_bg_ratio:.4f}, "
+                f"val_loss: {val_loss:.4f}, val_acc: {val_acc:.4f}, val_mIoU: {val_miou:.4f}, "
+                f"val_pred_bg: {val_pred_bg_ratio:.4f}, "
+                f"fg_w: {eff_fg_aux_weight:.3f}, bgw: {eff_bg_ratio_weight:.3f}, "
+                f"lr: {optimizer.param_groups[0]['lr']:.2e}"
             )
         else:
             print(
                 f"Epoch {epoch+1}/{args.epochs} - "
-                f"train_loss: {train_loss:.4f}, train_acc: {train_acc:.4f}"
+                f"train_loss: {train_loss:.4f}, train_acc: {train_acc:.4f}, train_mIoU: {train_miou:.4f}, "
+                f"train_pred_bg: {train_pred_bg_ratio:.4f}, "
+                f"fg_w: {eff_fg_aux_weight:.3f}, bgw: {eff_bg_ratio_weight:.3f}, "
+                f"lr: {optimizer.param_groups[0]['lr']:.2e}"
             )
+
+        if val_loss is not None:
+            if args.scheduler_monitor == "val_miou":
+                scheduler.step(val_miou)
+            else:
+                scheduler.step(val_loss)
+        else:
+            scheduler.step(train_loss)
+
+        if args.early_stop_patience > 0 and epochs_no_improve >= args.early_stop_patience:
+            print(
+                f"Early stopping triggered at epoch {epoch+1} "
+                f"(no mIoU improvement for {args.early_stop_patience} epoch(s))."
+            )
+            break
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -362,7 +1411,25 @@ def train(args: argparse.Namespace) -> None:
         torch.save({"model_state_dict": best_state, "in_channels": C}, ckpt_best)
         print(
             f"Saved best U-Net checkpoint to {ckpt_best} "
-            f"(val_loss={best_val_loss:.4f}, val_acc={best_val_acc:.4f})"
+            f"(val_loss={best_val_loss:.4f}, val_acc={best_val_acc:.4f}, val_mIoU={best_val_miou:.4f})"
+        )
+
+    # Export a few validation examples for qualitative inspection.
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    save_val_visualizations(
+        model=model,
+        val_ds=val_ds,
+        device=device,
+        output_dir=out_dir,
+        num_classes=args.num_classes,
+        ignore_index=args.ignore_index,
+        max_images=args.save_val_samples,
+    )
+    if val_ds is not None and len(val_ds) > 0 and args.save_val_samples > 0:
+        print(
+            f"Saved {min(args.save_val_samples, len(val_ds))} validation visualization(s) to "
+            f"{out_dir / 'val_visualizations'}"
         )
 
 
@@ -384,12 +1451,20 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     p.add_argument(
+        "--embedding_key",
+        type=str,
+        default="embeddings_native",
+        help="Embedding key in npz to use (auto/embeddings/embeddings_native/embeddings_per_time)",
+    )
+    p.add_argument(
         "--labels_file",
         type=str,
         required=True,
         help=(
             "Labels file (.npz with 'labels' key, or .npy integer mask). "
-            "When --per_patch_labels is set, this should instead be a directory "
+            "If this is a directory, per-patch matching is enabled automatically; "
+            "you can also force it with --per_patch_labels. In that case it should "
+            "be a directory "
             "containing per-patch files named ParcelIDs_XXXXX_labels.npz."
         ),
     )
@@ -400,12 +1475,18 @@ def parse_args() -> argparse.Namespace:
         help="Directory to save checkpoints and logs",
     )
     p.add_argument("--epochs", type=int, default=10, help="Number of training epochs")
-    p.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
+    p.add_argument("--lr", type=float, default=3e-4, help="Learning rate")
     p.add_argument(
         "--batch_size",
         type=int,
-        default=1,
-        help="Batch size for training and validation (default 1)",
+        default=4,
+        help="Batch size for training and validation (default 4)",
+    )
+    p.add_argument(
+        "--num_workers",
+        type=int,
+        default=4,
+        help="DataLoader workers (default 4)",
     )
     p.add_argument(
         "--num_classes",
@@ -420,10 +1501,43 @@ def parse_args() -> argparse.Namespace:
         help="Label index to ignore in loss (e.g., 'Void label' = 19)",
     )
     p.add_argument(
+        "--background_index",
+        type=int,
+        default=0,
+        help="Background class index (default 0).",
+    )
+    p.add_argument(
         "--base_channels",
         type=int,
         default=32,
         help="Base number of channels in U-Net encoder (default 32)",
+    )
+    p.add_argument(
+        "--unet_depth",
+        type=int,
+        default=4,
+        choices=[4, 5],
+        help="UNet depth: 4 (default) or 5 (deeper)",
+    )
+    p.add_argument(
+        "--model_variant",
+        type=str,
+        default="basic",
+        choices=["basic", "resse", "aspp"],
+        help="Segmentation model variant: basic UNet, resse UNet, or aspp DeepLabLite",
+    )
+    p.add_argument(
+        "--dropout_rate",
+        type=float,
+        default=0.1,
+        help="Dropout rate used by resse variant blocks (default 0.1)",
+    )
+    p.add_argument(
+        "--norm_type",
+        type=str,
+        default="group",
+        choices=["group", "batch"],
+        help="Normalization layer type in UNet blocks: group or batch (default group)",
     )
     p.add_argument(
         "--val_fraction",
@@ -449,6 +1563,229 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help="Device to use (cuda/cpu). Auto-detected if not provided",
+    )
+    p.add_argument(
+        "--resume_checkpoint",
+        type=str,
+        default="",
+        help="Path to a saved UNet checkpoint (.pt) to resume/fine-tune from",
+    )
+    p.add_argument(
+        "--resume_strict",
+        type=int,
+        default=1,
+        choices=[0, 1],
+        help="If 1, strictly match checkpoint keys when loading (default 1)",
+    )
+    p.add_argument(
+        "--weight_decay",
+        type=float,
+        default=1e-4,
+        help="Weight decay for AdamW optimizer (default 1e-4)",
+    )
+    p.add_argument(
+        "--enable_augmentation",
+        type=int,
+        default=1,
+        choices=[0, 1],
+        help="If 1, apply train-time data augmentation (default 1).",
+    )
+    p.add_argument(
+        "--normalize_features",
+        type=int,
+        default=1,
+        choices=[0, 1],
+        help="If 1, apply channel-wise feature normalization using train-set stats (default 1)",
+    )
+    p.add_argument(
+        "--feature_stats_max_samples",
+        type=int,
+        default=0,
+        help="Max train samples to estimate feature mean/std (0 means all, default 0)",
+    )
+    p.add_argument(
+        "--train_repeat_factor",
+        type=int,
+        default=3,
+        help="Virtual expansion factor for train set via repeated sampling (default 3)",
+    )
+    p.add_argument(
+        "--aug_flip_prob",
+        type=float,
+        default=0.5,
+        help="Probability for each random horizontal/vertical flip (default 0.5)",
+    )
+    p.add_argument(
+        "--aug_rot90_prob",
+        type=float,
+        default=0.5,
+        help="Probability of random 90-degree rotation (default 0.5)",
+    )
+    p.add_argument(
+        "--aug_noise_std",
+        type=float,
+        default=0.01,
+        help="Gaussian noise std added to embeddings (default 0.01)",
+    )
+    p.add_argument(
+        "--aug_gain_std",
+        type=float,
+        default=0.05,
+        help="Global multiplicative gain jitter std for embeddings (default 0.05)",
+    )
+    p.add_argument(
+        "--train_crop_size",
+        type=int,
+        default=96,
+        help="Random crop size for training augmentation (0 disables, default 96)",
+    )
+    p.add_argument(
+        "--fg_crop_prob",
+        type=float,
+        default=0.8,
+        help="Probability to center random crop on a foreground pixel (default 0.8)",
+    )
+    p.add_argument(
+        "--warmup_epochs",
+        type=int,
+        default=6,
+        help="Number of initial epochs trained on foreground-rich subset (0 disables, default 6)",
+    )
+    p.add_argument(
+        "--warmup_top_fg_fraction",
+        type=float,
+        default=0.35,
+        help="Top fraction of train samples by foreground ratio for warmup subset (default 0.35)",
+    )
+    p.add_argument(
+        "--use_fg_sampler",
+        type=int,
+        default=1,
+        choices=[0, 1],
+        help="If 1, use foreground-ratio weighted sampling for training batches (default 1)",
+    )
+    p.add_argument(
+        "--fg_sampler_power",
+        type=float,
+        default=1.5,
+        help="Exponent for foreground-ratio sample weights (default 1.5)",
+    )
+    p.add_argument(
+        "--fg_sampler_min_weight",
+        type=float,
+        default=0.2,
+        help="Minimum additive weight for each sample in foreground sampler (default 0.2)",
+    )
+    p.add_argument(
+        "--dice_weight",
+        type=float,
+        default=0.4,
+        help="Weight for Dice loss in total loss: CE + dice_weight*Dice (default 0.4)",
+    )
+    p.add_argument(
+        "--fg_aux_weight",
+        type=float,
+        default=0.6,
+        help="Weight for auxiliary foreground-vs-background loss (default 0.6)",
+    )
+    p.add_argument(
+        "--fg_aux_warmup_epochs",
+        type=int,
+        default=20,
+        help="Epochs to linearly warm up fg_aux_weight from 0 to target (default 20)",
+    )
+    p.add_argument(
+        "--background_ce_weight",
+        type=float,
+        default=0.05,
+        help="Maximum CE class weight for background class (default 0.05)",
+    )
+    p.add_argument(
+        "--bg_ratio_weight",
+        type=float,
+        default=1.0,
+        help="Weight for background-ratio matching loss (default 1.0)",
+    )
+    p.add_argument(
+        "--bg_ratio_warmup_epochs",
+        type=int,
+        default=20,
+        help="Epochs to linearly warm up bg_ratio_weight from 0 to target (default 20)",
+    )
+    p.add_argument(
+        "--ignore_background_in_dice",
+        type=int,
+        default=1,
+        choices=[0, 1],
+        help="If 1, exclude background class from Dice loss (default 1).",
+    )
+    p.add_argument(
+        "--ignore_background_in_metrics",
+        type=int,
+        default=1,
+        choices=[0, 1],
+        help="If 1, exclude background class from mIoU metric (default 1).",
+    )
+    p.add_argument(
+        "--label_smoothing",
+        type=float,
+        default=0.05,
+        help="Label smoothing for CrossEntropyLoss (default 0.05)",
+    )
+    p.add_argument(
+        "--class_weight_min",
+        type=float,
+        default=0.2,
+        help="Lower clamp for estimated class weights (default 0.2)",
+    )
+    p.add_argument(
+        "--class_weight_max",
+        type=float,
+        default=5.0,
+        help="Upper clamp for estimated class weights (default 5.0)",
+    )
+    p.add_argument(
+        "--lr_patience",
+        type=int,
+        default=5,
+        help="ReduceLROnPlateau patience in epochs (default 5)",
+    )
+    p.add_argument(
+        "--scheduler_monitor",
+        type=str,
+        default="val_miou",
+        choices=["val_loss", "val_miou"],
+        help="Metric for ReduceLROnPlateau: val_loss or val_miou (default val_miou)",
+    )
+    p.add_argument(
+        "--lr_decay_factor",
+        type=float,
+        default=0.5,
+        help="ReduceLROnPlateau decay factor (default 0.5)",
+    )
+    p.add_argument(
+        "--min_lr",
+        type=float,
+        default=1e-5,
+        help="Minimum learning rate for scheduler (default 1e-5)",
+    )
+    p.add_argument(
+        "--early_stop_patience",
+        type=int,
+        default=30,
+        help="Early stop after no val mIoU improvement for N epochs (0 disables, default 12)",
+    )
+    p.add_argument(
+        "--save_val_samples",
+        type=int,
+        default=4,
+        help="Number of validation samples to visualize and save (default 4)",
+    )
+    p.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed for train/val split and reproducibility (default 42)",
     )
     return p.parse_args()
 

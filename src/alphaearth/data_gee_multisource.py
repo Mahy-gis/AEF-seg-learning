@@ -3,6 +3,7 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
 
@@ -132,6 +133,20 @@ class GEEMultiSourceDataset(Dataset):
         pad_mask = np.zeros((target_T - t,), dtype=bool)
         return np.concatenate([x, pad], axis=0), np.concatenate([valid_mask, pad_mask], axis=0)
 
+    def _resize_spatial(self, arr: np.ndarray) -> np.ndarray:
+        """Resize (T, H, W, C) to (T, patch_size, patch_size, C)."""
+        if arr.shape[1] == self.patch_size and arr.shape[2] == self.patch_size:
+            return arr
+
+        tensor = torch.from_numpy(arr.astype(np.float32)).permute(0, 3, 1, 2)
+        tensor = F.interpolate(
+            tensor,
+            size=(self.patch_size, self.patch_size),
+            mode="bilinear",
+            align_corners=False,
+        )
+        return tensor.permute(0, 2, 3, 1).cpu().numpy()
+
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         path = self.files[idx]
         with np.load(path) as data:
@@ -146,12 +161,8 @@ class GEEMultiSourceDataset(Dataset):
                 arr = data[src]
                 if arr.ndim != 4:
                     raise ValueError(f"Source {src} must have shape (T, H, W, C), got {arr.shape}")
+                arr = self._resize_spatial(arr)
                 T_src, H_src, W_src, _ = arr.shape
-                if H_src != self.patch_size or W_src != self.patch_size:
-                    raise ValueError(
-                        "All inputs must share the same patch size and match patch_size; "
-                        "adjust download script or dataset."
-                    )
                 arrays[src] = arr
                 frame_valid[src] = self._frame_valid_mask(arr)
                 T_list.append(T_src)

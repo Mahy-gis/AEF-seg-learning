@@ -3,6 +3,7 @@ import itertools
 import math
 import time
 import random
+from datetime import datetime, timezone
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -29,10 +30,17 @@ class Trainer:
                  uniformity_weight: float = 0.01,
                  consistency_weight: float = 0.005,
                  detail_weight: float = 0.05,
+                 ssim_weight: float = 0.25,
+                 highfreq_weight: float = 0.08,
+                 granularity_weight: float = 0.0,
+                 granularity_num_prototypes: int = 8,
                  text_weight: float = 0.001,
+                 source_weights: Optional[Dict[str, float]] = None,
+                 grad_accum_steps: int = 1,
                  use_amp: bool = True,
                  uniformity_ramp_steps: int = 0,
-                 consistency_ramp_steps: int = 0):
+                 consistency_ramp_steps: int = 0,
+                 granularity_ramp_steps: int = 0):
         self.model = model
         self.dataloader = dataloader
         self.text_adapter = text_adapter
@@ -44,12 +52,19 @@ class Trainer:
             uniformity_weight=uniformity_weight,
             consistency_weight=consistency_weight,
             detail_weight=detail_weight,
+            ssim_weight=ssim_weight,
+            highfreq_weight=highfreq_weight,
+            granularity_weight=granularity_weight,
+            granularity_num_prototypes=granularity_num_prototypes,
             text_weight=text_weight,
+            source_weights=source_weights,
         )
         self.base_uniformity_weight = uniformity_weight
         self.base_consistency_weight = consistency_weight
+        self.base_granularity_weight = granularity_weight
         self.uniformity_ramp_steps = max(0, int(uniformity_ramp_steps))
         self.consistency_ramp_steps = max(0, int(consistency_ramp_steps))
+        self.granularity_ramp_steps = max(0, int(granularity_ramp_steps))
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
         self.use_amp = bool(use_amp) and self.device.type == 'cuda'
         self.model.to(self.device)
@@ -64,6 +79,7 @@ class Trainer:
         self.max_steps = 1000
         self.warmup_steps = 0
         self.start_step = 0
+        self.grad_accum_steps = max(1, int(grad_accum_steps))
         self._visualization_batches: Optional[Dict[str, Dict[str, Any]]] = None
         # Track losses for visualization
         self.loss_history = {
@@ -71,9 +87,12 @@ class Trainer:
             'total': [],
             'reconstruction': [],
             'detail': [],
+            'ssim': [],
+            'highfreq': [],
             'uniformity': [],
             'consistency': [],
             'clip': [],
+            'granularity': [],
         }
 
     def _prepare_reconstruction_targets(
@@ -105,8 +124,18 @@ class Trainer:
         safe_counts = valid_counts.clamp_min(1)
         center = (ts * frame_valid_mask.float()).sum(dim=1, keepdim=True) / safe_counts.float()
         distances = (ts - center).abs()
-        masked_distances = distances.masked_fill(~frame_valid_mask, float('inf'))
-        idx = masked_distances.argmin(dim=1)
+
+        # Prefer clearer frames (higher valid-pixel ratio), then temporal centrality.
+        # This is important for optical sources where some timestamps can be heavily
+        # clouded or near-empty, which otherwise drives reconstructions to blurry means.
+        valid_pixel = (x.abs().sum(dim=-1) > 1e-6).float()  # (B, T, H, W)
+        valid_ratio = valid_pixel.mean(dim=(2, 3))  # (B, T)
+        valid_ratio = valid_ratio * frame_valid_mask.float()
+
+        dist_norm = distances / (distances.max(dim=1, keepdim=True).values + 1e-6)
+        score = valid_ratio - 0.15 * dist_norm
+        score = score.masked_fill(~frame_valid_mask, float('-inf'))
+        idx = score.argmax(dim=1)
 
         no_valid = valid_counts.squeeze(1) == 0
         if no_valid.any():
@@ -191,7 +220,12 @@ class Trainer:
     def _run_reconstruction_preview(
         self,
         batch: Dict[str, Any],
-    ) -> tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+    ) -> tuple[
+        Dict[str, torch.Tensor],
+        Dict[str, torch.Tensor],
+        Dict[str, torch.Tensor],
+        Dict[str, torch.Tensor],
+    ]:
         source_data: Dict[str, torch.Tensor] = {
             k: v.to(self.device) for k, v in batch['source_data'].items()
         }
@@ -220,7 +254,22 @@ class Trainer:
 
         targets_cpu = {src: tensor.detach().cpu() for src, tensor in targets.items() if src in predictions}
         masks_cpu = {src: tensor.detach().cpu() for src, tensor in target_masks.items() if src in predictions}
-        return predictions, targets_cpu, masks_cpu
+        timestamps_cpu = {src: tensor.detach().cpu() for src, tensor in target_timestamps.items() if src in predictions}
+        return predictions, targets_cpu, masks_cpu, timestamps_cpu
+
+    def _format_timestamp(self, ts_value: float) -> str:
+        """Format timestamp for figure titles (prefer UTC date when value is epoch ms/s)."""
+        try:
+            x = float(ts_value)
+            if x > 1e11:  # epoch milliseconds
+                dt = datetime.fromtimestamp(x / 1000.0, tz=timezone.utc)
+                return dt.strftime('%Y-%m-%d')
+            if x > 1e9:  # epoch seconds
+                dt = datetime.fromtimestamp(x, tz=timezone.utc)
+                return dt.strftime('%Y-%m-%d')
+            return f"{x:.2f}"
+        except Exception:
+            return str(ts_value)
 
     def _to_display_rgb(self, src_name: str, arr: np.ndarray) -> np.ndarray:
         if arr.ndim == 2:
@@ -267,6 +316,7 @@ class Trainer:
 
         pbar = tqdm(range(self.start_step + 1, steps + 1), desc="Training", unit="step")
         start_time = time.time()
+        self.optim.zero_grad(set_to_none=True)
         
         for step in pbar:
             # Gradually enable regularization so early training focuses on reconstruction.
@@ -281,6 +331,12 @@ class Trainer:
                 self.loss_fn.consistency_weight = self.base_consistency_weight * cons_scale
             else:
                 self.loss_fn.consistency_weight = self.base_consistency_weight
+
+            if self.granularity_ramp_steps > 0:
+                gran_scale = min(1.0, step / float(self.granularity_ramp_steps))
+                self.loss_fn.granularity_weight = self.base_granularity_weight * gran_scale
+            else:
+                self.loss_fn.granularity_weight = self.base_granularity_weight
 
             batch = next(data_iter)
             step_start_time = time.time()
@@ -336,22 +392,36 @@ class Trainer:
                 losses = self.loss_fn(outputs_for_loss)
                 loss = losses['total']
 
-            self.optim.zero_grad(set_to_none=True)
+                target_valid_ratio = torch.tensor(0.0, device=self.device)
+                if target_masks:
+                    vals = [m.float().mean() for m in target_masks.values()]
+                    target_valid_ratio = torch.stack(vals).mean()
+
+            loss_to_backward = loss / float(self.grad_accum_steps)
             if self.use_amp:
-                self.scaler.scale(loss).backward()
-                self.scaler.step(self.optim)
-                self.scaler.update()
+                self.scaler.scale(loss_to_backward).backward()
+                should_step = (step % self.grad_accum_steps == 0) or (step == steps)
+                if should_step:
+                    self.scaler.step(self.optim)
+                    self.scaler.update()
+                    self.optim.zero_grad(set_to_none=True)
             else:
-                loss.backward()
-                self.optim.step()
+                loss_to_backward.backward()
+                should_step = (step % self.grad_accum_steps == 0) or (step == steps)
+                if should_step:
+                    self.optim.step()
+                    self.optim.zero_grad(set_to_none=True)
 
             self.loss_history['steps'].append(step)
             self.loss_history['total'].append(float(loss))
             self.loss_history['reconstruction'].append(float(losses.get('reconstruction', torch.tensor(0.0))))
             self.loss_history['detail'].append(float(losses.get('detail', torch.tensor(0.0))))
+            self.loss_history['ssim'].append(float(losses.get('ssim', torch.tensor(0.0))))
+            self.loss_history['highfreq'].append(float(losses.get('highfreq', torch.tensor(0.0))))
             self.loss_history['uniformity'].append(float(losses.get('uniformity', torch.tensor(0.0))))
             self.loss_history['consistency'].append(float(losses.get('consistency', torch.tensor(0.0))))
             self.loss_history['clip'].append(float(losses.get('clip', torch.tensor(0.0))))
+            self.loss_history['granularity'].append(float(losses.get('granularity', torch.tensor(0.0))))
             
             recon_loss = float(losses.get('reconstruction', torch.tensor(0.0)))
             pbar.set_postfix({
@@ -361,18 +431,34 @@ class Trainer:
             
             if step % log_every == 0:
                 recon = float(losses.get('reconstruction', torch.tensor(0.0)))
+                recon_wmean = float(losses.get('reconstruction_weighted_mean', torch.tensor(0.0)))
                 detail = float(losses.get('detail', torch.tensor(0.0)))
+                ssim = float(losses.get('ssim', torch.tensor(0.0)))
+                highfreq = float(losses.get('highfreq', torch.tensor(0.0)))
                 uni = float(losses.get('uniformity', torch.tensor(0.0)))
                 cons = float(losses.get('consistency', torch.tensor(0.0)))
                 clip = float(losses.get('clip', torch.tensor(0.0)))
+                gran = float(losses.get('granularity', torch.tensor(0.0)))
+                tgt_valid = float(target_valid_ratio)
+                s1 = losses.get('recon_src_sentinel1')
+                s2 = losses.get('recon_src_sentinel2')
+                l8 = losses.get('recon_src_landsat')
                 elapsed = time.time() - start_time
                 steps_per_sec = step / elapsed if elapsed > 0 else 0
                 remaining_steps = steps - step
                 eta_seconds = remaining_steps / steps_per_sec if steps_per_sec > 0 else 0
                 eta_hours = eta_seconds / 3600
+                source_msg = []
+                if s1 is not None:
+                    source_msg.append(f"s1 {float(s1):.4f}")
+                if s2 is not None:
+                    source_msg.append(f"s2 {float(s2):.4f}")
+                if l8 is not None:
+                    source_msg.append(f"l8 {float(l8):.4f}")
+                source_suffix = f" | {' | '.join(source_msg)}" if source_msg else ""
                 print(f"\nstep {step:05d}/{steps:05d} ({step/steps*100:.1f}%) | "
-                    f"total {float(loss):.4f} | recon {recon:.4f} | detail {detail:.4f} | uni {uni:.4f} | cons {cons:.4f} | clip {clip:.4f} | "
-                        f"w_uni {self.loss_fn.uniformity_weight:.4f} | w_cons {self.loss_fn.consistency_weight:.4f} | "
+                    f"total {float(loss):.4f} | recon {recon:.4f} | recon_wmean {recon_wmean:.4f} | detail {detail:.4f} | ssim {ssim:.4f} | hf {highfreq:.4f} | uni {uni:.4f} | cons {cons:.4f} | gran {gran:.4f} | clip {clip:.4f} | tgt_valid {tgt_valid:.3f}{source_suffix} | "
+                        f"w_uni {self.loss_fn.uniformity_weight:.4f} | w_cons {self.loss_fn.consistency_weight:.4f} | w_gran {self.loss_fn.granularity_weight:.4f} | "
                       f"ETA: {eta_hours:.2f}h ({steps_per_sec:.2f} steps/s)")
             
             if self.output_dir:
@@ -393,13 +479,25 @@ class Trainer:
         checkpoint_path: str,
         load_optimizer: bool = True,
         reset_step: bool = False,
+        strict: bool = True,
     ) -> int:
         ckpt_path = Path(checkpoint_path)
         if not ckpt_path.exists():
             raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
 
         checkpoint = torch.load(ckpt_path, map_location=self.device)
-        self.model.load_state_dict(checkpoint['model_state_dict'])
+        load_result = self.model.load_state_dict(checkpoint['model_state_dict'], strict=strict)
+        if not strict:
+            if getattr(load_result, 'unexpected_keys', None):
+                print(
+                    "Warning: ignoring unexpected checkpoint keys (likely decoder/source mismatch): "
+                    f"{load_result.unexpected_keys}"
+                )
+            if getattr(load_result, 'missing_keys', None):
+                print(
+                    "Warning: model has parameters not found in checkpoint (will keep initialization): "
+                    f"{load_result.missing_keys}"
+                )
 
         if load_optimizer and 'optimizer_state_dict' in checkpoint:
             self.optim.load_state_dict(checkpoint['optimizer_state_dict'])
@@ -443,6 +541,7 @@ class Trainer:
             random.shuffle(indices)
 
             selected_samples: List[Dict[str, Any]] = []
+            selected_indices: List[int] = []
             for idx in indices:
                 sample = dataset[idx]
                 frame_masks = sample.get('frame_valid_mask', {})
@@ -453,6 +552,7 @@ class Trainer:
                     has_valid = True
                 if has_valid:
                     selected_samples.append(sample)
+                    selected_indices.append(idx)
                 if len(selected_samples) >= max_samples_per_source:
                     break
 
@@ -462,7 +562,7 @@ class Trainer:
             preview_batch = collate_fn(selected_samples)
 
             try:
-                predictions, targets, masks = self._run_reconstruction_preview(preview_batch)
+                predictions, targets, masks, target_ts = self._run_reconstruction_preview(preview_batch)
             except RuntimeError as e:
                 # 若在可视化阶段出现 CUDA OOM，则跳过本次可视化以保证训练不中断。
                 if 'out of memory' in str(e).lower():
@@ -495,15 +595,29 @@ class Trainer:
                 pred_b = pred[batch_idx].numpy()
                 target_b = target[batch_idx].numpy()
 
-                pred_rgb = self._stretch_for_display(self._to_display_rgb(src_name, pred_b))
-                target_rgb = self._stretch_for_display(self._to_display_rgb(src_name, target_b))
+                sample_idx = selected_indices[batch_idx] if batch_idx < len(selected_indices) else batch_idx
+                sample_id = str(sample_idx)
+                if hasattr(dataset, 'files') and sample_idx < len(getattr(dataset, 'files', [])):
+                    sample_file = dataset.files[sample_idx]
+                    stem = sample_file.stem
+                    if stem.startswith('sample_'):
+                        sample_id = stem.split('sample_', 1)[1]
+
+                ts_text = 'n/a'
+                if src_name in target_ts and batch_idx < target_ts[src_name].shape[0]:
+                    ts_text = self._format_timestamp(float(target_ts[src_name][batch_idx].item()))
+
+                pred_rgb_raw = self._to_display_rgb(src_name, pred_b)
+                target_rgb_raw = self._to_display_rgb(src_name, target_b)
+                pred_rgb = self._stretch_for_display(pred_rgb_raw)
+                target_rgb = self._stretch_for_display(target_rgb_raw)
                 
                 axes[row_idx, 0].imshow(target_rgb)
-                axes[row_idx, 0].set_title('Target RGB')
+                axes[row_idx, 0].set_title(f'Target ID:{sample_id} T:{ts_text}')
                 axes[row_idx, 0].axis('off')
                 
                 axes[row_idx, 1].imshow(pred_rgb)
-                axes[row_idx, 1].set_title('Prediction RGB')
+                axes[row_idx, 1].set_title(f'Prediction ID:{sample_id} T:{ts_text}')
                 axes[row_idx, 1].axis('off')
             
             plt.tight_layout()
@@ -567,10 +681,17 @@ def create_trainer(model: AlphaEarthFoundations,
                    uniformity_weight: float = 0.01,
                    consistency_weight: float = 0.005,
                    detail_weight: float = 0.05,
+                   ssim_weight: float = 0.25,
+                   highfreq_weight: float = 0.08,
+                   granularity_weight: float = 0.0,
+                   granularity_num_prototypes: int = 8,
                    text_weight: float = 0.001,
+                   source_weights: Optional[Dict[str, float]] = None,
+                   grad_accum_steps: int = 1,
                    use_amp: bool = True,
                    uniformity_ramp_steps: int = 0,
-                   consistency_ramp_steps: int = 0) -> Trainer:
+                   consistency_ramp_steps: int = 0,
+                   granularity_ramp_steps: int = 0) -> Trainer:
     return Trainer(
         model=model,
         dataloader=dataloader,
@@ -582,8 +703,15 @@ def create_trainer(model: AlphaEarthFoundations,
         uniformity_weight=uniformity_weight,
         consistency_weight=consistency_weight,
         detail_weight=detail_weight,
+        ssim_weight=ssim_weight,
+        highfreq_weight=highfreq_weight,
+        granularity_weight=granularity_weight,
+        granularity_num_prototypes=granularity_num_prototypes,
         text_weight=text_weight,
+        source_weights=source_weights,
+        grad_accum_steps=grad_accum_steps,
         use_amp=use_amp,
         uniformity_ramp_steps=uniformity_ramp_steps,
         consistency_ramp_steps=consistency_ramp_steps,
+        granularity_ramp_steps=granularity_ramp_steps,
     )

@@ -331,8 +331,22 @@ class AlphaEarthFoundations(nn.Module):
             if decode_timestamps is not None and src in decode_timestamps:
                 decode_ts = decode_timestamps[src].to(feats_teacher.device)
 
+            # For reconstruction alignment, prefer features nearest to the requested
+            # decode timestamp instead of always using temporally pooled embeddings.
+            # This improves one-to-one correspondence with the selected target frame.
+            recon_embeddings = mu_t
+            if decode_timestamps is not None and src in decode_timestamps:
+                dt = (ts - decode_ts.unsqueeze(1)).abs()  # (B, T)
+                if teacher_mask is not None:
+                    dt = dt.masked_fill(~teacher_mask, float('inf'))
+                nearest_idx = dt.argmin(dim=1)  # (B,)
+                b_idx = torch.arange(B, device=feats_teacher.device)
+                feats_at_decode_ts = feats_teacher[b_idx, nearest_idx]  # (B, H', W', d_p)
+                recon_embeddings = self.summarizer.proj_64(feats_at_decode_ts)
+                recon_embeddings = F.normalize(recon_embeddings, p=2, dim=-1)
+
             recon = self.decoder(
-                embeddings=mu_t,
+                embeddings=recon_embeddings,
                 geometry_metadata=geometry_metadata,
                 timestamps=decode_ts,
                 valid_period=(vp[:, 0], vp[:, 1]) if isinstance(vp, tuple) else (vp[:, 0], vp[:, 1]),

@@ -34,7 +34,7 @@ def main() -> None:
     parser.add_argument(
         "--batch_size",
         type=int,
-        default=4,
+        default=2,
         help="Batch size",
     )
     parser.add_argument(
@@ -44,9 +44,15 @@ def main() -> None:
         help="Number of data loading workers",
     )
     parser.add_argument(
+        "--grad_accum_steps",
+        type=int,
+        default=1,
+        help="Gradient accumulation steps; effective batch = batch_size * grad_accum_steps.",
+    )
+    parser.add_argument(
         "--patch_size",
         type=int,
-        default=256,
+        default=128,
         help="Spatial patch size (H, W)",
     )
     parser.add_argument(
@@ -116,6 +122,48 @@ def main() -> None:
         help="Weight for gradient/detail reconstruction loss term (default 0.05).",
     )
     parser.add_argument(
+        "--ssim_weight",
+        type=float,
+        default=0.25,
+        help="Weight for SSIM reconstruction loss term (default 0.25).",
+    )
+    parser.add_argument(
+        "--highfreq_weight",
+        type=float,
+        default=0.08,
+        help="Weight for high-frequency reconstruction loss term (default 0.08).",
+    )
+    parser.add_argument(
+        "--granularity_weight",
+        type=float,
+        default=0.0,
+        help="Weight for unsupervised fine-grained prototype separation loss (default 0.0).",
+    )
+    parser.add_argument(
+        "--granularity_num_prototypes",
+        type=int,
+        default=8,
+        help="Number of random prototypes per patch used by granularity loss (default 8).",
+    )
+    parser.add_argument(
+        "--source_weight_landsat",
+        type=float,
+        default=1.0,
+        help="Per-source reconstruction weight for landsat.",
+    )
+    parser.add_argument(
+        "--source_weight_sentinel2",
+        type=float,
+        default=1.5,
+        help="Per-source reconstruction weight for sentinel2.",
+    )
+    parser.add_argument(
+        "--source_weight_sentinel1",
+        type=float,
+        default=0.1,
+        help="Per-source reconstruction weight for sentinel1.",
+    )
+    parser.add_argument(
         "--uniformity_ramp_steps",
         type=int,
         default=0,
@@ -126,6 +174,12 @@ def main() -> None:
         type=int,
         default=0,
         help="Linearly ramp consistency weight from 0 to target over this many steps (0 disables ramp).",
+    )
+    parser.add_argument(
+        "--granularity_ramp_steps",
+        type=int,
+        default=0,
+        help="Linearly ramp granularity weight from 0 to target over this many steps (0 disables ramp).",
     )
     parser.add_argument(
         "--model_size",
@@ -188,6 +242,16 @@ def main() -> None:
         default=0,
         choices=[0, 1],
         help="If 1, reset trainer step to 0 after loading checkpoint weights.",
+    )
+    parser.add_argument(
+        "--resume_strict",
+        type=int,
+        default=1,
+        choices=[0, 1],
+        help=(
+            "If 1, require checkpoint/model parameter names to match exactly. "
+            "Set 0 when changing reconstruction_sources (e.g., resume from S1+S2 into S2-only)."
+        ),
     )
 
     args = parser.parse_args()
@@ -282,9 +346,20 @@ def main() -> None:
         uniformity_weight=args.uniformity_weight,
         consistency_weight=args.consistency_weight,
         detail_weight=args.detail_weight,
+        ssim_weight=args.ssim_weight,
+        highfreq_weight=args.highfreq_weight,
+        granularity_weight=args.granularity_weight,
+        granularity_num_prototypes=args.granularity_num_prototypes,
+        source_weights={
+            'landsat': args.source_weight_landsat,
+            'sentinel2': args.source_weight_sentinel2,
+            'sentinel1': args.source_weight_sentinel1,
+        },
+        grad_accum_steps=args.grad_accum_steps,
         use_amp=bool(args.amp),
         uniformity_ramp_steps=args.uniformity_ramp_steps,
         consistency_ramp_steps=args.consistency_ramp_steps,
+        granularity_ramp_steps=args.granularity_ramp_steps,
     )
 
     trainer.max_steps = max_steps
@@ -301,14 +376,16 @@ def main() -> None:
     if resume_path is not None:
         load_optimizer = bool(args.resume_load_optimizer)
         reset_step = bool(args.reset_step_on_resume)
+        strict = bool(args.resume_strict)
         resumed_step = trainer.load_checkpoint(
             str(resume_path),
             load_optimizer=load_optimizer,
             reset_step=reset_step,
+            strict=strict,
         )
         print(
             f"Resumed from checkpoint: {resume_path} "
-            f"(step={resumed_step}, load_optimizer={load_optimizer}, reset_step={reset_step})"
+            f"(step={resumed_step}, load_optimizer={load_optimizer}, reset_step={reset_step}, strict={strict})"
         )
 
     print(f"Starting training for {max_steps} steps...")

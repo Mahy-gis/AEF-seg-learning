@@ -9,6 +9,25 @@ from alphaearth.architecture.STPBlock import STPBlock
 from alphaearth.architecture.laplacian_pyramid_exchange import LearnedSpatialResampling
 
 
+INT32_MAX = 2_147_483_647
+
+
+def _safe_adaptive_avg_pool2d(x: torch.Tensor, output_hw: tuple[int, int]) -> torch.Tensor:
+    """Run adaptive_avg_pool2d with CUDA int32-index safety by chunking batch if needed."""
+    if (not x.is_cuda) or x.numel() < INT32_MAX:
+        return F.adaptive_avg_pool2d(x, output_hw)
+
+    _, c, h, w = x.shape
+    elements_per_item = max(1, c * h * w)
+    max_items_per_chunk = max(1, INT32_MAX // elements_per_item)
+
+    pooled_chunks = []
+    for start in range(0, x.shape[0], max_items_per_chunk):
+        end = min(start + max_items_per_chunk, x.shape[0])
+        pooled_chunks.append(F.adaptive_avg_pool2d(x[start:end], output_hw))
+    return torch.cat(pooled_chunks, dim=0)
+
+
 class STPEncoder(nn.Module):
     """
     Space Time Precision encoder 
@@ -64,24 +83,24 @@ class STPEncoder(nn.Module):
         # Initialize features at different resolutions using pathway projections
         # Space pathway: project to space_dim and downsample to 1/16L
         space_features = self.space_projection(x_proj)
-        space_features = F.adaptive_avg_pool2d(
+        space_features = _safe_adaptive_avg_pool2d(
             rearrange(space_features, 'b t h w c -> (b t) c h w'),
-            (H // 16, W // 16)
+            (max(1, H // 16), max(1, W // 16))
         )
         space_features = rearrange(space_features, '(b t) c h w -> b t h w c', b=B, t=T)
         
         # Time pathway: project to time_dim and downsample to 1/8L  
         time_features = self.time_projection(x_proj)
-        time_features = F.adaptive_avg_pool2d(
+        time_features = _safe_adaptive_avg_pool2d(
             rearrange(time_features, 'b t h w c -> (b t) c h w'),
-            (H // 8, W // 8)
+            (max(1, H // 8), max(1, W // 8))
         )
         time_features = rearrange(time_features, '(b t) c h w -> b t h w c', b=B, t=T)
         
         # Precision pathway: keep at precision_dim and downsample to 1/2L
-        precision_features = F.adaptive_avg_pool2d(
+        precision_features = _safe_adaptive_avg_pool2d(
             rearrange(x_proj, 'b t h w c -> (b t) c h w'),
-            (H // 2, W // 2)
+            (max(1, H // 2), max(1, W // 2))
         )
         precision_features = rearrange(precision_features, '(b t) c h w -> b t h w c', b=B, t=T)
 

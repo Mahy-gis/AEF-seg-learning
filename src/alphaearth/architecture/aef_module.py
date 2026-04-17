@@ -59,9 +59,15 @@ class TimePooling(nn.Module):
         logits = logits.squeeze(2)                                      # (BHW, heads, T)
 
         if mask is not None:
-            mask_flat = mask.unsqueeze(1).unsqueeze(1)                 # (B,1,1,T)
-            mask_flat = mask_flat.expand(B, H * W, self.num_heads, T)  # (B,HW,heads,T)
-            mask_flat = mask_flat.reshape(BHW, self.num_heads, T)      # (BHW,heads,T)
+            # 保证mask shape为(B, T)
+            if mask.dim() == 1:
+                mask = mask.unsqueeze(1)  # (B, 1)
+            B, T = mask.shape
+            mask_flat = mask[:, None, None, :]  # (B, 1, 1, T)
+            mask_flat = mask_flat.expand(B, H, W, T)  # (B, H, W, T)
+            mask_flat = mask_flat.contiguous().view(B*H*W, 1, T).expand(-1, self.num_heads, -1)  # (BHW, heads, T)
+            if T == 1:
+                mask_flat = mask_flat.squeeze(-1)  # (BHW, heads)
             logits = logits.masked_fill(mask_flat == 0, float('-inf'))
 
         attn = torch.softmax(logits, dim=-1)

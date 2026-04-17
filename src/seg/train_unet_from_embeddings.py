@@ -7,7 +7,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader, Subset, WeightedRandomSampler
-from scipy.ndimage import zoom
 import matplotlib.pyplot as plt
 
 
@@ -21,7 +20,30 @@ def prepare_features_from_embeddings(emb_npz: Path, embedding_key: str = "auto")
       - embeddings: (H,W,64)
       - embeddings_per_time: (T,H,W,64) -> (T*64,H,W)
     """
-    data = np.load(emb_npz)
+    data = np.load(emb_npz, allow_pickle=True)
+
+    # Also support plain .npy embeddings in addition to .npz containers.
+    if isinstance(data, np.ndarray):
+        e = data
+        if e.ndim == 4:
+            # (T,H,W,64) or (T,64,H,W)
+            if e.shape[-1] == 64:
+                e_chw = np.transpose(e, (0, 3, 1, 2))
+            elif e.shape[1] == 64:
+                e_chw = e
+            else:
+                raise ValueError(f"Unexpected ndarray embedding shape {e.shape} in {emb_npz}")
+            T, C, H, W = e_chw.shape
+            feats = e_chw.reshape(T * C, H, W)
+        elif e.ndim == 3:
+            # (H,W,64) or already (C,H,W)
+            if e.shape[-1] == 64:
+                feats = np.transpose(e, (2, 0, 1))
+            else:
+                feats = e
+        else:
+            raise ValueError(f"Unsupported ndarray embedding ndim={e.ndim} in {emb_npz}")
+        return feats.astype(np.float32)
 
     if embedding_key != "auto":
         if embedding_key not in data:
@@ -67,10 +89,20 @@ def resize_labels_to(features: np.ndarray, labels: np.ndarray) -> np.ndarray:
     if (H_f, W_f) == (H_l, W_l):
         return labels
 
-    zoom_h = H_f / H_l
-    zoom_w = W_f / W_l
-    resized = zoom(labels, zoom=(zoom_h, zoom_w), order=0)
-    return resized.astype(labels.dtype)
+    # Use interpolate to guarantee exact output size.
+    t = torch.from_numpy(labels.astype(np.float32)).unsqueeze(0).unsqueeze(0)
+    t = nn.functional.interpolate(t, size=(H_f, W_f), mode="nearest")
+    return t.squeeze(0).squeeze(0).numpy().astype(labels.dtype)
+
+
+def resize_features_to(features: np.ndarray, out_h: int, out_w: int) -> np.ndarray:
+    """Resize features (C,H,W) to exact target size using bilinear interpolation."""
+    _, h, w = features.shape
+    if (h, w) == (out_h, out_w):
+        return features
+    t = torch.from_numpy(features).unsqueeze(0)
+    t = nn.functional.interpolate(t, size=(out_h, out_w), mode="bilinear", align_corners=False)
+    return t.squeeze(0).numpy().astype(np.float32)
 
 
 class EmbeddingSegmentationDataset(Dataset):
@@ -95,10 +127,14 @@ class EmbeddingSegmentationDataset(Dataset):
         labels_path: Path,
         per_patch_labels: bool = False,
         embedding_key: str = "auto",
+        resample_size: int = 0,
     ):
         self.embeddings_path = embeddings_path
         self.per_patch_labels = per_patch_labels
         self.embedding_key = embedding_key
+        self.resample_size = max(0, int(resample_size))
+        # 可选：用于“按索引一一对应”的标签模式（例如 embedding_0000.npz ↔ 20250413_000_label.npy）。
+        self.index_label_files: Optional[List[Path]] = None
 
         if per_patch_labels:
             if not labels_path.is_dir():
@@ -121,18 +157,32 @@ class EmbeddingSegmentationDataset(Dataset):
             self.labels_dir = None
 
         if embeddings_path.is_dir():
-            # Collect all npz files under the directory.
+            # Collect all embedding files under the directory.
             self.files: List[Path] = sorted(
-                [p for p in embeddings_path.glob("*.npz") if p.is_file()]
+                [
+                    p
+                    for ext in ("*.npz", "*.npy")
+                    for p in embeddings_path.glob(ext)
+                    if p.is_file()
+                ]
             )
             if not self.files:
                 raise FileNotFoundError(
-                    f"No .npz files found in embeddings directory {embeddings_path}"
+                    f"No embedding files (.npz/.npy) found in embeddings directory {embeddings_path}"
                 )
         else:
             if not embeddings_path.exists():
                 raise FileNotFoundError(f"Embeddings npz not found: {embeddings_path}")
             self.files = [embeddings_path]
+
+        # 若是 per-patch 模式，但标签文件名并非 sample_*/ParcelIDs_*，
+        # 且标签数量与 embedding 数量一致，则启用“按索引一一对应”的匹配策略。
+        if self.per_patch_labels and self.labels_dir is not None and embeddings_path.is_dir():
+            label_files = sorted([p for p in self.labels_dir.glob("*_label.npy") if p.is_file()])
+            has_sample_prefix = any(p.name.startswith("sample_") for p in label_files)
+            has_parcel_prefix = any(p.name.startswith("ParcelIDs_") for p in label_files)
+            if (not has_sample_prefix and not has_parcel_prefix) and len(label_files) == len(self.files):
+                self.index_label_files = label_files
 
     def __len__(self) -> int:
         return len(self.files)
@@ -140,23 +190,70 @@ class EmbeddingSegmentationDataset(Dataset):
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         emb_file = self.files[idx]
         feats = prepare_features_from_embeddings(emb_file, embedding_key=self.embedding_key)  # (C,H,W)
+        if self.resample_size > 0:
+            feats = resize_features_to(feats, self.resample_size, self.resample_size)
 
         if self.per_patch_labels:
-            # Parse numeric suffix XXXXX from embedding filename (e.g., embedding_XXXXX.npz
-            # or any name whose stem ends with digits). Use it to construct
-            # the corresponding label filename ParcelIDs_XXXXX_labels.npz.
-            stem = emb_file.stem
-            m = re.search(r"(\d+)$", stem)
-            if m is None:
-                raise ValueError(
-                    f"Cannot extract numeric patch id from embedding filename {emb_file.name}"
-                )
-            patch_str = m.group(1)
-            label_file = self.labels_dir / f"ParcelIDs_{patch_str}_labels.npz"  # type: ignore[operator]
-            if not label_file.exists():
+            label_file: Optional[Path] = None
+
+            # 优先：若启用了按索引对应模式，则直接使用预先排序好的标签列表。
+            if self.index_label_files is not None:
+                if idx >= len(self.index_label_files):
+                    raise IndexError(
+                        f"Index {idx} out of range for index-based labels list of length {len(self.index_label_files)}"
+                    )
+                label_file = self.index_label_files[idx]
+            else:
+                # 默认 Per-patch 模式：根据 embedding 文件名推断对应的标签文件。
+                # 兼容主要组织方式：
+                #   1) 原始示例：embedding_XXXXX*.npz  <-> ParcelIDs_XXXXX_labels.npz
+                #   2) 本项目当前数据：embedding_XXXXXX_YY.npz <-> sample_XXXXXX_YY_label.(npz|npy)
+                #   3) MTS12 AEF：eopath_ID_COL_ROW.npy <-> ParcelIDs_ID_labels.npz
+                #   4) PASTIS-R 常见命名：embedding_XXXXX.npz <-> ParcelIDs_XXXXX.npy
+                stem = emb_file.stem  # e.g., "embedding_00241_00"
+
+                # 先去掉前缀 "embedding_"，保留完整 patch id（如 "00241_00"、"126582_37" 等）。
+                patch_token = stem
+                if patch_token.startswith("embedding_"):
+                    patch_token = patch_token[len("embedding_") :]
+
+                # 候选标签文件名按常见模式依次尝试。
+                candidate_paths: List[Path] = []
+                if self.labels_dir is not None:
+                    # 当前数据集使用的 sample_XXXX_YY_label.(npy/npz)
+                    candidate_paths.append(self.labels_dir / f"sample_{patch_token}_label.npy")
+                    candidate_paths.append(self.labels_dir / f"sample_{patch_token}_label.npz")
+
+                    # MTS12 AEF 命名：eopath_<id>_<col>_<row>，标签按 ID 命名。
+                    m_eopath = re.match(r"^eopath_(\d+)_\d+_\d+$", patch_token)
+                    if m_eopath is not None:
+                        patch_id = int(m_eopath.group(1))
+                        candidate_paths.append(self.labels_dir / f"ParcelIDs_{patch_id:05d}_labels.npz")
+                        candidate_paths.append(self.labels_dir / f"ParcelIDs_{patch_id}_labels.npz")
+                        candidate_paths.append(self.labels_dir / f"ParcelIDs_{patch_id:05d}.npy")
+                        candidate_paths.append(self.labels_dir / f"ParcelIDs_{patch_id}.npy")
+
+                    # 向后兼容原始 ParcelIDs_XXXXX_labels.npz 方案（仅使用末尾数字串）。
+                    m = re.search(r"(\d+)$", patch_token)
+                    if m is not None:
+                        patch_suffix = m.group(1)
+                        candidate_paths.append(self.labels_dir / f"ParcelIDs_{int(patch_suffix):05d}_labels.npz")
+                        candidate_paths.append(self.labels_dir / f"ParcelIDs_{patch_suffix}_labels.npz")
+                        candidate_paths.append(self.labels_dir / f"ParcelIDs_{int(patch_suffix):05d}.npy")
+                        candidate_paths.append(self.labels_dir / f"ParcelIDs_{patch_suffix}.npy")
+
+                for cand in candidate_paths:
+                    if cand.exists():
+                        label_file = cand
+                        break
+
+            if label_file is None:
                 raise FileNotFoundError(
-                    f"Per-patch label file not found for embedding {emb_file.name}: {label_file}"
+                    "Per-patch label file not found for embedding "
+                    f"{emb_file.name}; tried: "
+                    + ", ".join(str(c) for c in candidate_paths)
                 )
+
             data = np.load(label_file, allow_pickle=True)
             if isinstance(data, np.lib.npyio.NpzFile) and "labels" in data:
                 labels_np = data["labels"]
@@ -168,6 +265,9 @@ class EmbeddingSegmentationDataset(Dataset):
                 )
         else:
             labels_np = self.labels_np  # type: ignore[assignment]
+
+
+        labels_np = labels_np.astype(np.int64)
 
         labels_resized = resize_labels_to(feats, labels_np)
         features = torch.from_numpy(feats)  # (C,H,W)
@@ -339,7 +439,40 @@ def estimate_sample_foreground_ratios(
     return np.asarray(ratios, dtype=np.float32)
 
 
-# ---------- Simple U-Net implementation ----------
+def estimate_label_valid_ratio(
+    dataset: Dataset,
+    num_classes: int,
+    ignore_index: int,
+    max_samples: int = 16,
+) -> tuple[float, int, int]:
+    """Estimate how many label pixels are in valid range.
+
+    A valid pixel is either ignore_index or in [0, num_classes-1].
+    """
+    n = min(len(dataset), max(1, int(max_samples)))
+    if n <= 0:
+        return 1.0, 0, 0
+
+    valid_count = 0
+    total_count = 0
+    global_min = None
+    global_max = None
+
+    for i in range(n):
+        _x, y = dataset[i]
+        y = y.view(-1).to(torch.int64)
+
+        ymin = int(y.min().item())
+        ymax = int(y.max().item())
+        global_min = ymin if global_min is None else min(global_min, ymin)
+        global_max = ymax if global_max is None else max(global_max, ymax)
+
+        valid = (y == ignore_index) | ((y >= 0) & (y < num_classes))
+        valid_count += int(valid.sum().item())
+        total_count += int(y.numel())
+
+    ratio = float(valid_count) / float(max(1, total_count))
+    return ratio, int(global_min if global_min is not None else 0), int(global_max if global_max is not None else 0)
 
 
 class DoubleConv(nn.Module):
@@ -418,7 +551,27 @@ class AttentionGate(nn.Module):
         self.psi = nn.Conv2d(inter_ch, 1, kernel_size=1, bias=True)
 
     def forward(self, skip: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
-        alpha = torch.sigmoid(self.psi(torch.relu(self.theta(skip) + self.phi(gate))))
+        theta_skip = self.theta(skip)
+        phi_gate = self.phi(gate)
+
+        # 对齐空间尺寸，避免由于下采样/上采样舍入导致的 1 像素差异
+        if theta_skip.shape[-2:] != phi_gate.shape[-2:]:
+            h = min(theta_skip.shape[-2], phi_gate.shape[-2])
+            w = min(theta_skip.shape[-1], phi_gate.shape[-1])
+
+            def center_crop(t: torch.Tensor, target_h: int, target_w: int) -> torch.Tensor:
+                _, _, th, tw = t.shape
+                start_h = max((th - target_h) // 2, 0)
+                start_w = max((tw - target_w) // 2, 0)
+                return t[:, :, start_h : start_h + target_h, start_w : start_w + target_w]
+
+            theta_skip = center_crop(theta_skip, h, w)
+            phi_gate = center_crop(phi_gate, h, w)
+
+            # 同时裁剪 skip 到相同空间尺寸
+            skip = center_crop(skip, h, w)
+
+        alpha = torch.sigmoid(self.psi(torch.relu(theta_skip + phi_gate)))
         return skip * alpha
 
 
@@ -437,12 +590,16 @@ class UNet(nn.Module):
         self.bottleneck = DoubleConv(base_ch * 8, base_ch * 16, norm=norm)
 
         self.up4 = nn.ConvTranspose2d(base_ch * 16, base_ch * 8, kernel_size=2, stride=2)
+        self.ag4 = AttentionGate(skip_ch=base_ch * 8, gate_ch=base_ch * 8, inter_ch=max(base_ch * 4, 8))
         self.dec4 = DoubleConv(base_ch * 16, base_ch * 8, norm=norm)
         self.up3 = nn.ConvTranspose2d(base_ch * 8, base_ch * 4, kernel_size=2, stride=2)
+        self.ag3 = AttentionGate(skip_ch=base_ch * 4, gate_ch=base_ch * 4, inter_ch=max(base_ch * 2, 8))
         self.dec3 = DoubleConv(base_ch * 8, base_ch * 4, norm=norm)
         self.up2 = nn.ConvTranspose2d(base_ch * 4, base_ch * 2, kernel_size=2, stride=2)
+        self.ag2 = AttentionGate(skip_ch=base_ch * 2, gate_ch=base_ch * 2, inter_ch=max(base_ch, 8))
         self.dec2 = DoubleConv(base_ch * 4, base_ch * 2, norm=norm)
         self.up1 = nn.ConvTranspose2d(base_ch * 2, base_ch, kernel_size=2, stride=2)
+        self.ag1 = AttentionGate(skip_ch=base_ch, gate_ch=base_ch, inter_ch=max(base_ch // 2, 8))
         self.dec1 = DoubleConv(base_ch * 2, base_ch, norm=norm)
 
         self.out_conv = nn.Conv2d(base_ch, num_classes, kernel_size=1)
@@ -457,19 +614,23 @@ class UNet(nn.Module):
 
         # Decoder with skip connections
         x = self.up4(xb)
-        x = torch.cat([x4, x], dim=1)
+        x4_gated = self.ag4(x4, x)
+        x = torch.cat([x4_gated, x], dim=1)
         x = self.dec4(x)
 
         x = self.up3(x)
-        x = torch.cat([x3, x], dim=1)
+        x3_gated = self.ag3(x3, x)
+        x = torch.cat([x3_gated, x], dim=1)
         x = self.dec3(x)
 
         x = self.up2(x)
-        x = torch.cat([x2, x], dim=1)
+        x2_gated = self.ag2(x2, x)
+        x = torch.cat([x2_gated, x], dim=1)
         x = self.dec2(x)
 
         x = self.up1(x)
-        x = torch.cat([x1, x], dim=1)
+        x1_gated = self.ag1(x1, x)
+        x = torch.cat([x1_gated, x], dim=1)
         x = self.dec1(x)
 
         return self.out_conv(x)
@@ -498,14 +659,19 @@ class UNetDeep(nn.Module):
         self.bottleneck = DoubleConv(base_ch * 16, base_ch * 32, norm=norm)
 
         self.up5 = nn.ConvTranspose2d(base_ch * 32, base_ch * 16, kernel_size=2, stride=2)
+        self.ag5 = AttentionGate(skip_ch=base_ch * 16, gate_ch=base_ch * 16, inter_ch=max(base_ch * 8, 8))
         self.dec5 = DoubleConv(base_ch * 32, base_ch * 16, norm=norm)
         self.up4 = nn.ConvTranspose2d(base_ch * 16, base_ch * 8, kernel_size=2, stride=2)
+        self.ag4 = AttentionGate(skip_ch=base_ch * 8, gate_ch=base_ch * 8, inter_ch=max(base_ch * 4, 8))
         self.dec4 = DoubleConv(base_ch * 16, base_ch * 8, norm=norm)
         self.up3 = nn.ConvTranspose2d(base_ch * 8, base_ch * 4, kernel_size=2, stride=2)
+        self.ag3 = AttentionGate(skip_ch=base_ch * 4, gate_ch=base_ch * 4, inter_ch=max(base_ch * 2, 8))
         self.dec3 = DoubleConv(base_ch * 8, base_ch * 4, norm=norm)
         self.up2 = nn.ConvTranspose2d(base_ch * 4, base_ch * 2, kernel_size=2, stride=2)
+        self.ag2 = AttentionGate(skip_ch=base_ch * 2, gate_ch=base_ch * 2, inter_ch=max(base_ch, 8))
         self.dec2 = DoubleConv(base_ch * 4, base_ch * 2, norm=norm)
         self.up1 = nn.ConvTranspose2d(base_ch * 2, base_ch, kernel_size=2, stride=2)
+        self.ag1 = AttentionGate(skip_ch=base_ch, gate_ch=base_ch, inter_ch=max(base_ch // 2, 8))
         self.dec1 = DoubleConv(base_ch * 2, base_ch, norm=norm)
 
         self.out_conv = nn.Conv2d(base_ch, num_classes, kernel_size=1)
@@ -519,23 +685,28 @@ class UNetDeep(nn.Module):
         xb = self.bottleneck(self.pool5(x5))
 
         x = self.up5(xb)
-        x = torch.cat([x5, x], dim=1)
+        x5_gated = self.ag5(x5, x)
+        x = torch.cat([x5_gated, x], dim=1)
         x = self.dec5(x)
 
         x = self.up4(x)
-        x = torch.cat([x4, x], dim=1)
+        x4_gated = self.ag4(x4, x)
+        x = torch.cat([x4_gated, x], dim=1)
         x = self.dec4(x)
 
         x = self.up3(x)
-        x = torch.cat([x3, x], dim=1)
+        x3_gated = self.ag3(x3, x)
+        x = torch.cat([x3_gated, x], dim=1)
         x = self.dec3(x)
 
         x = self.up2(x)
-        x = torch.cat([x2, x], dim=1)
+        x2_gated = self.ag2(x2, x)
+        x = torch.cat([x2_gated, x], dim=1)
         x = self.dec2(x)
 
         x = self.up1(x)
-        x = torch.cat([x1, x], dim=1)
+        x1_gated = self.ag1(x1, x)
+        x = torch.cat([x1_gated, x], dim=1)
         x = self.dec1(x)
 
         return self.out_conv(x)
@@ -651,7 +822,6 @@ class ASPP(nn.Module):
 
 
 class DeepLabLite(nn.Module):
-    """DeepLabV3+-style lightweight head for embedding segmentation."""
 
     def __init__(self, in_channels: int, num_classes: int = 20, base_ch: int = 32, norm: str = "group"):
         super().__init__()
@@ -694,6 +864,36 @@ class DeepLabLite(nn.Module):
         return x
 
 
+def align_logits_and_target_spatial(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Center-crop logits/target to a common spatial size.
+
+    This keeps training robust when model output spatial size differs slightly
+    from labels due to pooling/upsampling rounding.
+    """
+    if logits.shape[-2:] == target.shape[-2:]:
+        return logits, target
+
+    h = min(logits.shape[-2], target.shape[-2])
+    w = min(logits.shape[-1], target.shape[-1])
+
+    def _crop4d(t: torch.Tensor, ch: int, cw: int) -> torch.Tensor:
+        th, tw = t.shape[-2], t.shape[-1]
+        sh = max((th - ch) // 2, 0)
+        sw = max((tw - cw) // 2, 0)
+        return t[:, :, sh : sh + ch, sw : sw + cw]
+
+    def _crop3d(t: torch.Tensor, ch: int, cw: int) -> torch.Tensor:
+        th, tw = t.shape[-2], t.shape[-1]
+        sh = max((th - ch) // 2, 0)
+        sw = max((tw - cw) // 2, 0)
+        return t[:, sh : sh + ch, sw : sw + cw]
+
+    return _crop4d(logits, h, w), _crop3d(target, h, w)
+
+
 class SoftDiceLoss(nn.Module):
     def __init__(
         self,
@@ -711,6 +911,7 @@ class SoftDiceLoss(nn.Module):
         self.ignore_background = ignore_background
 
     def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        logits, target = align_logits_and_target_spatial(logits, target)
         probs = torch.softmax(logits, dim=1)  # (B,C,H,W)
         valid_mask = (target != self.ignore_index).float()  # (B,H,W)
 
@@ -732,8 +933,167 @@ class SoftDiceLoss(nn.Module):
             losses.append(1.0 - dice)
 
         if not losses:
-            return logits.new_tensor(0.0)
+            # Keep zero-loss connected to autograd graph to avoid backward() errors.
+            return logits.sum() * 0.0
         return torch.stack(losses).mean()
+
+
+class FocalLossWithSampling(nn.Module):
+    """多类 Focal Loss + patch 内 0/1/2 类像素有放回重采样。
+
+    对于每个样本：
+      1. 仅在 focus_classes (默认 [0,1,2]) 且非 ignore_index 的像素上工作；
+      2. 统计各类像素数，取其中最大值 n_max；
+      3. 对每一类有放回采样 n_max 个像素；
+      4. 在这些采样像素上计算 Focal Loss。
+    """
+
+    def __init__(
+        self,
+        num_classes: int,
+        gamma: float = 2.0,
+        ignore_index: int = 255,
+        focus_classes: Optional[List[int]] = None,
+        class_weights: Optional[List[float]] = None,
+    ) -> None:
+        super().__init__()
+        self.num_classes = num_classes
+        self.gamma = gamma
+        self.ignore_index = ignore_index
+        if focus_classes is None:
+            focus_classes = [0, 1, 2]
+        self.focus_classes = focus_classes
+
+        # 可选：为不同类别指定 Focal Loss 权重（例如提高 class 1 的权重）。
+        if class_weights is not None:
+            w = torch.as_tensor(class_weights, dtype=torch.float32)
+            if w.numel() < num_classes:
+                pad = torch.ones(num_classes - w.numel(), dtype=torch.float32)
+                w = torch.cat([w, pad], dim=0)
+            elif w.numel() > num_classes:
+                w = w[:num_classes]
+            self.register_buffer("class_weights", w)
+        else:
+            self.class_weights = None
+
+    def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        logits, target = align_logits_and_target_spatial(logits, target)
+        B, C, H, W = logits.shape
+        device = logits.device
+
+        logits_flat = logits.view(B, C, -1).permute(0, 2, 1)  # (B,N,C)
+        target_flat = target.reshape(B, -1)  # (B,N)
+
+        focus = [
+            c
+            for c in self.focus_classes
+            if 0 <= c < self.num_classes and c != self.ignore_index
+        ]
+
+        # 若 focus_classes 无效，则退化为所有合法像素上的标准 Focal Loss。
+        if not focus:
+            all_logits = logits_flat.reshape(-1, C)
+            all_target = target_flat.reshape(-1)
+            # 仅在合法类别上计算：排除 ignore_index 以及越界标签
+            valid_mask = (
+                (all_target != self.ignore_index)
+                & (all_target >= 0)
+                & (all_target < self.num_classes)
+            )
+            if not valid_mask.any():
+                return logits.sum() * 0.0
+            all_logits = all_logits[valid_mask]
+            all_target = all_target[valid_mask]
+            log_probs = nn.functional.log_softmax(all_logits, dim=1)
+            ce = nn.functional.nll_loss(log_probs, all_target, reduction="none")
+            pt = torch.exp(-ce)
+
+            if self.class_weights is not None:
+                w = self.class_weights[all_target]
+                loss = ((1.0 - pt) ** self.gamma) * ce * w
+            else:
+                loss = ((1.0 - pt) ** self.gamma) * ce
+            return loss.mean()
+
+        selected_logits: List[torch.Tensor] = []
+        selected_targets: List[torch.Tensor] = []
+
+        for b in range(B):
+            y_b = target_flat[b]  # (N,)
+            valid_mask = y_b != self.ignore_index
+            if not valid_mask.any():
+                continue
+
+            idx_valid = torch.nonzero(valid_mask, as_tuple=False).squeeze(1)
+            y_valid = y_b[valid_mask]
+
+            class_indices = {}
+            max_count = 0
+            for cls in focus:
+                idx_cls = idx_valid[y_valid == cls]
+                if idx_cls.numel() > 0:
+                    class_indices[cls] = idx_cls
+                    if idx_cls.numel() > max_count:
+                        max_count = idx_cls.numel()
+
+            if max_count == 0:
+                continue
+
+            sampled_pos_list = []
+            for cls, idx_cls in class_indices.items():
+                # 对该类的像素做有放回采样，使每类像素数约为 max_count。
+                if idx_cls.numel() == 1:
+                    sampled = idx_cls.expand(max_count)
+                else:
+                    rand_idx = torch.randint(0, idx_cls.numel(), (max_count,), device=device)
+                    sampled = idx_cls[rand_idx]
+                sampled_pos_list.append(sampled)
+
+            if not sampled_pos_list:
+                continue
+
+            sampled_pos = torch.cat(sampled_pos_list, dim=0)
+
+            # 保险起见，再做一次索引范围过滤，防止任何越界索引进入 CUDA 内核。
+            N = logits_flat.shape[1]
+            in_bounds = (sampled_pos >= 0) & (sampled_pos < N)
+            if not in_bounds.any():
+                continue
+            sampled_pos = sampled_pos[in_bounds]
+
+            selected_logits.append(logits_flat[b, sampled_pos, :])
+            selected_targets.append(y_b[sampled_pos])
+
+        if not selected_logits:
+            return logits.sum() * 0.0
+
+        logits_sel = torch.cat(selected_logits, dim=0)
+        target_sel = torch.cat(selected_targets, dim=0)
+
+        # 再次过滤，确保标签在 [0, num_classes-1] 且不为 ignore_index，避免越界索引
+        valid = (
+            (target_sel != self.ignore_index)
+            & (target_sel >= 0)
+            & (target_sel < self.num_classes)
+        )
+        if not valid.any():
+            return logits.sum() * 0.0
+        logits_sel = logits_sel[valid]
+        target_sel = target_sel[valid]
+
+        log_probs = nn.functional.log_softmax(logits_sel, dim=1)
+        ce = nn.functional.nll_loss(log_probs, target_sel, reduction="none")
+        pt = torch.exp(-ce)
+
+        if self.class_weights is not None:
+            class_weights = self.class_weights
+            if class_weights.device != target_sel.device:
+                class_weights = class_weights.to(target_sel.device)
+            w = class_weights[target_sel]
+            loss = ((1.0 - pt) ** self.gamma) * ce * w
+        else:
+            loss = ((1.0 - pt) ** self.gamma) * ce
+        return loss.mean()
 
 
 def foreground_aux_loss(
@@ -751,7 +1111,7 @@ def foreground_aux_loss(
     n_classes = probs.shape[1]
     fg_classes = [c for c in range(n_classes) if c not in (background_index, ignore_index)]
     if not fg_classes:
-        return logits.new_tensor(0.0)
+        return logits.sum() * 0.0
 
     fg_prob = probs[:, fg_classes, :, :].sum(dim=1).clamp(1e-6, 1.0 - 1e-6)
     valid = (target != ignore_index)
@@ -791,7 +1151,9 @@ def estimate_class_weights(
 
     for _x, y in loader:
         y_flat = y.view(-1)
-        valid = y_flat != ignore_index
+        # 仅统计合法类别 [0, num_classes-1]，并排除 ignore_index；
+        # 对于 255 等越界值，自动视为 ignore，避免 bincount 长度>num_classes。
+        valid = (y_flat != ignore_index) & (y_flat >= 0) & (y_flat < num_classes)
         if valid.any():
             binc = torch.bincount(y_flat[valid], minlength=num_classes).to(torch.float64)
             counts += binc
@@ -820,6 +1182,7 @@ def compute_segmentation_metrics(
     ignore_background: bool = True,
 ) -> tuple[float, float]:
     """Return (pixel_acc, mean_iou) on valid pixels."""
+    logits, target = align_logits_and_target_spatial(logits, target)
     preds = logits.argmax(dim=1)
     mask = target != ignore_index
     valid = int(mask.sum().item())
@@ -845,13 +1208,62 @@ def compute_segmentation_metrics(
     return pixel_acc, miou
 
 
-def labels_to_rgb(mask: np.ndarray, num_classes: int, ignore_index: int) -> np.ndarray:
+def evaluate_per_class_iou(
+    model: nn.Module,
+    data_loader: DataLoader,
+    device: torch.device,
+    num_classes: int,
+    ignore_index: int,
+    background_index: int = 0,
+    ignore_background: bool = True,
+) -> np.ndarray:
+    """Compute per-class IoU on a dataset.
+
+    Returns a numpy array of length ``num_classes`` where entries for
+    ignored classes (``ignore_index`` and optionally ``background_index``)
+    are set to NaN.
+    """
+
+    inter = np.zeros(num_classes, dtype=np.float64)
+    union = np.zeros(num_classes, dtype=np.float64)
+
+    model.eval()
+    with torch.no_grad():
+        for x, y in data_loader:
+            x = x.to(device)
+            y = y.to(device)
+            logits = model(x)
+            logits, y = align_logits_and_target_spatial(logits, y)
+            preds = logits.argmax(dim=1)
+
+            mask = y != ignore_index
+
+            for cls in range(num_classes):
+                if cls == ignore_index:
+                    continue
+                if ignore_background and cls == background_index:
+                    continue
+
+                p = (preds == cls) & mask
+                t = (y == cls) & mask
+                inter[cls] += (p & t).sum().item()
+                union[cls] += (p | t).sum().item()
+
+    per_class_iou = np.full(num_classes, np.nan, dtype=np.float32)
+    for cls in range(num_classes):
+        if union[cls] > 0.0 and not np.isnan(union[cls]):
+            per_class_iou[cls] = float(inter[cls] / union[cls])
+
+    return per_class_iou
+
+
+def labels_to_rgb(mask, num_classes, ignore_index):
     cmap = plt.get_cmap("tab20", num_classes)
     palette = cmap(np.arange(num_classes))[:, :3]
     safe_mask = np.clip(mask, 0, num_classes - 1)
     rgb = palette[safe_mask]
-    if 0 <= ignore_index < num_classes:
-        rgb[mask == ignore_index] = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+    # 无论 ignore_index 是否 < num_classes，都单独覆盖颜色
+    rgb[mask == ignore_index] = np.array([1.0, 1.0, 1.0], dtype=np.float32)
     return rgb
 
 
@@ -948,7 +1360,7 @@ def load_unet_checkpoint(model: nn.Module, checkpoint_path: Path, device: torch.
 # ---------- Training script ----------
 
 
-def train(args: argparse.Namespace) -> None:
+def train(args: argparse.Namespace):
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
@@ -963,40 +1375,99 @@ def train(args: argparse.Namespace) -> None:
     if not labels_path.exists():
         raise FileNotFoundError(f"Labels file not found: {labels_path}")
 
-    # Auto-switch to per-patch label mode when labels_path is a directory.
-    # This matches datasets organized as:
-    #   embedding_<id>.npz <-> ParcelIDs_<id>_labels.npz
-    per_patch_labels = bool(args.per_patch_labels or labels_path.is_dir())
+    # Train dataset (always来自 embeddings_path / labels_file)
+    per_patch_labels_train = bool(args.per_patch_labels or labels_path.is_dir())
     if labels_path.is_dir() and not args.per_patch_labels:
         print(
-            "Detected labels directory; enabling per-patch label matching automatically "
+            "Detected train labels directory; enabling per-patch label matching automatically "
             "(equivalent to --per_patch_labels)."
         )
 
     full_dataset = EmbeddingSegmentationDataset(
         emb_path,
         labels_path,
-        per_patch_labels=per_patch_labels,
+        per_patch_labels=per_patch_labels_train,
         embedding_key=args.embedding_key,
+        resample_size=args.resample_size,
     )
 
-    # Peek at one sample to infer channel and spatial sizes.
+    # Peek at one train sample to infer channel and spatial sizes.
     sample_feats, sample_labels = full_dataset[0]
     C, H, W = sample_feats.shape
     print(f"Full dataset size: {len(full_dataset)} samples")
     print(f"Sample features shape (C,H,W)=({C},{H},{W}), labels shape (H,W)=({H},{W})")
 
-    # Train/val split
-    n_total = len(full_dataset)
-    n_val = max(1, int(n_total * args.val_fraction)) if n_total > 1 else 0
-    n_train = n_total - n_val
-    indices = np.random.permutation(n_total)
-    train_idx = indices[:n_train]
-    val_idx = indices[n_train:] if n_val > 0 else np.array([], dtype=int)
+    # Fail fast if labels are not class indices (common mistake: using raw ParcelIDs_*.npy).
+    valid_ratio, y_min, y_max = estimate_label_valid_ratio(
+        full_dataset,
+        num_classes=args.num_classes,
+        ignore_index=args.ignore_index,
+        max_samples=16,
+    )
+    if valid_ratio < 0.95:
+        sample_unique = torch.unique(sample_labels.view(-1)).cpu().numpy().tolist()
+        sample_unique_preview = sample_unique[:12]
+        raise ValueError(
+            "Label sanity check failed: most label pixels are outside valid class range. "
+            f"valid_ratio={valid_ratio:.4f}, min={y_min}, max={y_max}, "
+            f"num_classes={args.num_classes}, ignore_index={args.ignore_index}, "
+            f"sample_unique_head={sample_unique_preview}. "
+            "This usually means labels are raw parcel IDs (e.g., ParcelIDs_XXXXX.npy) rather than class indices. "
+            "Please convert labels to class-index masks first (labels in [0, num_classes-1], plus ignore_index), "
+            "or set the correct --ignore_index if your void label is not the current value."
+        )
 
-    raw_base_train_ds = Subset(full_dataset, train_idx.tolist())
-    base_train_ds = raw_base_train_ds
-    base_val_ds = Subset(full_dataset, val_idx.tolist()) if n_val > 0 else None
+    # Train/val split 或使用单独的验证集
+    raw_base_train_ds = None
+    base_train_ds = None
+    base_val_ds = None
+
+    if args.val_embeddings_path and args.val_labels_file:
+        # 使用独立的验证集：val_embeddings_path / val_labels_file
+        val_emb_path = Path(args.val_embeddings_path)
+        val_labels_path = Path(args.val_labels_file)
+        if not val_emb_path.exists():
+            raise FileNotFoundError(f"Val embeddings path not found: {val_emb_path}")
+        if not val_labels_path.exists():
+            raise FileNotFoundError(f"Val labels file not found: {val_labels_path}")
+
+        per_patch_labels_val = bool(args.per_patch_labels or val_labels_path.is_dir())
+        if val_labels_path.is_dir() and not args.per_patch_labels:
+            print(
+                "Detected val labels directory; enabling per-patch label matching automatically "
+                "(equivalent to --per_patch_labels)."
+            )
+
+        val_full_dataset = EmbeddingSegmentationDataset(
+            val_emb_path,
+            val_labels_path,
+            per_patch_labels=per_patch_labels_val,
+            embedding_key=args.embedding_key,
+            resample_size=args.resample_size,
+        )
+
+        # 训练集全部样本都用于训练；warmup 等逻辑依旧使用 train_idx=range(len(full_dataset))
+        n_total = len(full_dataset)
+        train_idx = np.arange(n_total, dtype=int)
+        raw_base_train_ds = Subset(full_dataset, train_idx.tolist())
+        base_train_ds = raw_base_train_ds
+        base_val_ds = val_full_dataset
+        print(
+            f"Using external validation set: train_samples={len(base_train_ds)}, "
+            f"val_samples={len(base_val_ds)}"
+        )
+    else:
+        # 默认行为：在单一数据集上按 val_fraction 做随机划分
+        n_total = len(full_dataset)
+        n_val = max(1, int(n_total * args.val_fraction)) if n_total > 1 else 0
+        n_train = n_total - n_val
+        indices = np.random.permutation(n_total)
+        train_idx = indices[:n_train]
+        val_idx = indices[n_train:] if n_val > 0 else np.array([], dtype=int)
+
+        raw_base_train_ds = Subset(full_dataset, train_idx.tolist())
+        base_train_ds = raw_base_train_ds
+        base_val_ds = Subset(full_dataset, val_idx.tolist()) if n_val > 0 else None
 
     if args.normalize_features == 1 and len(base_train_ds) > 0:
         feat_mean, feat_std = estimate_feature_channel_stats(
@@ -1169,24 +1640,80 @@ def train(args: argparse.Namespace) -> None:
             strict=bool(args.resume_strict),
         )
 
-    # Weighted CE + Dice is more robust under class imbalance.
-    class_weights = estimate_class_weights(
-        base_train_ds,
-        args.num_classes,
-        args.ignore_index,
+    # 损失：Focal Loss（带 0/1/2 类像素重采样） + Dice Loss。
+    focal_class_weights = None
+    if getattr(args, "focal_class_weights", ""):
+        try:
+            focal_class_weights = [
+                float(x)
+                for x in str(args.focal_class_weights).split(",")
+                if x.strip() != ""
+            ]
+            print(f"Using focal class weights: {focal_class_weights}")
+        except ValueError:
+            print(
+                f"Warning: could not parse --focal_class_weights='{args.focal_class_weights}', "
+                "falling back to uniform weights."
+            )
+            focal_class_weights = None
+
+    # Focal 采样类别：默认使用全部前景类（排除 background 与 ignore）。
+    focus_classes: List[int]
+    focus_spec = str(getattr(args, "focal_focus_classes", "all_fg")).strip().lower()
+    if focus_spec in ("", "all", "all_fg"):
+        focus_classes = [
+            c
+            for c in range(args.num_classes)
+            if c not in (args.background_index, args.ignore_index)
+        ]
+    else:
+        parsed: List[int] = []
+        for tok in str(args.focal_focus_classes).split(","):
+            tok = tok.strip()
+            if tok == "":
+                continue
+            try:
+                parsed.append(int(tok))
+            except ValueError:
+                continue
+        focus_classes = [
+            c
+            for c in parsed
+            if 0 <= c < args.num_classes and c != args.ignore_index
+        ]
+    if not focus_classes:
+        # 兜底：至少使用所有合法类别，避免退化为空。
+        focus_classes = [c for c in range(args.num_classes) if c != args.ignore_index]
+    print(f"Focal focus classes: {focus_classes}")
+
+    criterion_focal = FocalLossWithSampling(
+        num_classes=args.num_classes,
+        gamma=args.focal_gamma,
+        ignore_index=args.ignore_index,
+        focus_classes=focus_classes,
+        class_weights=focal_class_weights,
+    )
+
+    # CE provides dense per-pixel supervision and stabilizes optimization.
+    ce_class_weights = estimate_class_weights(
+        raw_base_train_ds,
+        num_classes=args.num_classes,
+        ignore_index=args.ignore_index,
         min_weight=args.class_weight_min,
         max_weight=args.class_weight_max,
-    ).to(device)
-    if 0 <= args.background_index < args.num_classes and args.background_ce_weight >= 0:
-        class_weights[args.background_index] = min(
-            class_weights[args.background_index].item(),
+    )
+    if 0 <= args.background_index < args.num_classes:
+        ce_class_weights[args.background_index] = min(
+            float(ce_class_weights[args.background_index].item()),
             float(args.background_ce_weight),
         )
+    print(f"CE class weights: {ce_class_weights.tolist()}")
     criterion_ce = nn.CrossEntropyLoss(
+        weight=ce_class_weights.to(device),
         ignore_index=args.ignore_index,
-        weight=class_weights,
-        label_smoothing=args.label_smoothing,
+        label_smoothing=max(0.0, float(args.label_smoothing)),
     )
+
     criterion_dice = SoftDiceLoss(
         num_classes=args.num_classes,
         ignore_index=args.ignore_index,
@@ -1203,8 +1730,6 @@ def train(args: argparse.Namespace) -> None:
         min_lr=args.min_lr,
     )
 
-    print("Estimated class weights:", class_weights.detach().cpu().numpy().round(4).tolist())
-
     best_val_loss = float("inf")
     best_val_acc = 0.0
     best_val_miou = 0.0
@@ -1213,11 +1738,6 @@ def train(args: argparse.Namespace) -> None:
 
     for epoch in range(args.epochs):
         model.train()
-        # Warm up auxiliary constraints gradually to avoid harming early generalization.
-        fg_aux_scale = min(1.0, float(epoch + 1) / max(1, args.fg_aux_warmup_epochs))
-        bg_ratio_scale = min(1.0, float(epoch + 1) / max(1, args.bg_ratio_warmup_epochs))
-        eff_fg_aux_weight = args.fg_aux_weight * fg_aux_scale
-        eff_bg_ratio_weight = args.bg_ratio_weight * bg_ratio_scale
         running_loss = 0.0
         running_correct = 0
         running_total = 0
@@ -1227,15 +1747,34 @@ def train(args: argparse.Namespace) -> None:
         running_pred_total = 0
 
         active_loader = warmup_loader if (warmup_loader is not None and epoch < args.warmup_epochs) else train_loader
+
+        fg_aux_scale = 0.0
+        if args.fg_aux_weight > 0:
+            if args.fg_aux_warmup_epochs > 0:
+                fg_aux_scale = min(1.0, float(epoch + 1) / float(args.fg_aux_warmup_epochs))
+            else:
+                fg_aux_scale = 1.0
+        fg_aux_scale *= float(args.fg_aux_weight)
+
+        bg_ratio_scale = 0.0
+        if args.bg_ratio_weight > 0:
+            if args.bg_ratio_warmup_epochs > 0:
+                bg_ratio_scale = min(1.0, float(epoch + 1) / float(args.bg_ratio_warmup_epochs))
+            else:
+                bg_ratio_scale = 1.0
+        bg_ratio_scale *= float(args.bg_ratio_weight)
+
         for x, y in active_loader:
             x = x.to(device)
             y = y.to(device)
 
             optimizer.zero_grad()
             logits = model(x)  # (B,num_classes,H,W)
+            logits, y = align_logits_and_target_spatial(logits, y)
             loss_ce = criterion_ce(logits, y)
+            loss_focal = criterion_focal(logits, y)
             loss_dice = criterion_dice(logits, y)
-            loss_fg = foreground_aux_loss(
+            loss_fg_aux = foreground_aux_loss(
                 logits,
                 y,
                 background_index=args.background_index,
@@ -1249,9 +1788,10 @@ def train(args: argparse.Namespace) -> None:
             )
             loss = (
                 loss_ce
+                + loss_focal
                 + args.dice_weight * loss_dice
-                + eff_fg_aux_weight * loss_fg
-                + eff_bg_ratio_weight * loss_bg_ratio
+                + fg_aux_scale * loss_fg_aux
+                + bg_ratio_scale * loss_bg_ratio
             )
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -1301,9 +1841,11 @@ def train(args: argparse.Namespace) -> None:
                     x = x.to(device)
                     y = y.to(device)
                     logits = model(x)
+                    logits, y = align_logits_and_target_spatial(logits, y)
                     loss_ce = criterion_ce(logits, y)
+                    loss_focal = criterion_focal(logits, y)
                     loss_dice = criterion_dice(logits, y)
-                    loss_fg = foreground_aux_loss(
+                    loss_fg_aux = foreground_aux_loss(
                         logits,
                         y,
                         background_index=args.background_index,
@@ -1317,9 +1859,10 @@ def train(args: argparse.Namespace) -> None:
                     )
                     loss = (
                         loss_ce
+                        + loss_focal
                         + args.dice_weight * loss_dice
-                        + eff_fg_aux_weight * loss_fg
-                        + eff_bg_ratio_weight * loss_bg_ratio
+                        + fg_aux_scale * loss_fg_aux
+                        + bg_ratio_scale * loss_bg_ratio
                     )
                     val_running_loss += loss.item() * x.size(0)
 
@@ -1370,7 +1913,6 @@ def train(args: argparse.Namespace) -> None:
                 f"train_pred_bg: {train_pred_bg_ratio:.4f}, "
                 f"val_loss: {val_loss:.4f}, val_acc: {val_acc:.4f}, val_mIoU: {val_miou:.4f}, "
                 f"val_pred_bg: {val_pred_bg_ratio:.4f}, "
-                f"fg_w: {eff_fg_aux_weight:.3f}, bgw: {eff_bg_ratio_weight:.3f}, "
                 f"lr: {optimizer.param_groups[0]['lr']:.2e}"
             )
         else:
@@ -1378,7 +1920,6 @@ def train(args: argparse.Namespace) -> None:
                 f"Epoch {epoch+1}/{args.epochs} - "
                 f"train_loss: {train_loss:.4f}, train_acc: {train_acc:.4f}, train_mIoU: {train_miou:.4f}, "
                 f"train_pred_bg: {train_pred_bg_ratio:.4f}, "
-                f"fg_w: {eff_fg_aux_weight:.3f}, bgw: {eff_bg_ratio_weight:.3f}, "
                 f"lr: {optimizer.param_groups[0]['lr']:.2e}"
             )
 
@@ -1414,9 +1955,30 @@ def train(args: argparse.Namespace) -> None:
             f"(val_loss={best_val_loss:.4f}, val_acc={best_val_acc:.4f}, val_mIoU={best_val_miou:.4f})"
         )
 
-    # Export a few validation examples for qualitative inspection.
+    # Export a few validation examples for qualitative inspection and
+    # compute per-class IoU on the best checkpoint (if available).
     if best_state is not None:
         model.load_state_dict(best_state)
+
+        if val_loader is not None and val_ds is not None and len(val_ds) > 0:
+            per_class_iou = evaluate_per_class_iou(
+                model=model,
+                data_loader=val_loader,
+                device=device,
+                num_classes=args.num_classes,
+                ignore_index=args.ignore_index,
+                background_index=args.background_index,
+                ignore_background=args.ignore_background_in_metrics,
+            )
+
+            # 打印每个类别在 best checkpoint 下的 IoU。
+            print("Per-class IoU on best checkpoint (NaN = ignored / no pixels):")
+            for cls_idx, iou in enumerate(per_class_iou):
+                print(f"  class {cls_idx}: {iou:.4f}" if not np.isnan(iou) else f"  class {cls_idx}: NaN")
+
+            # 同时保存到输出目录，方便后续分析。
+            np.save(out_dir / "best_val_per_class_iou.npy", per_class_iou)
+
     save_val_visualizations(
         model=model,
         val_ds=val_ds,
@@ -1432,8 +1994,15 @@ def train(args: argparse.Namespace) -> None:
             f"{out_dir / 'val_visualizations'}"
         )
 
+    # 返回本次训练的关键验证指标，便于在外部脚本中做超参搜索对比。
+    return {
+        "best_val_loss": float(best_val_loss),
+        "best_val_acc": float(best_val_acc),
+        "best_val_miou": float(best_val_miou),
+    }
 
-def parse_args() -> argparse.Namespace:
+
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description=(
             "Train a simple U-Net segmentation model using AEF embeddings "
@@ -1457,6 +2026,12 @@ def parse_args() -> argparse.Namespace:
         help="Embedding key in npz to use (auto/embeddings/embeddings_native/embeddings_per_time)",
     )
     p.add_argument(
+        "--resample_size",
+        type=int,
+        default=0,
+        help="If >0, resize each embedding/label sample to this square size before training (e.g., 256).",
+    )
+    p.add_argument(
         "--labels_file",
         type=str,
         required=True,
@@ -1466,6 +2041,25 @@ def parse_args() -> argparse.Namespace:
             "you can also force it with --per_patch_labels. In that case it should "
             "be a directory "
             "containing per-patch files named ParcelIDs_XXXXX_labels.npz."
+        ),
+    )
+    p.add_argument(
+        "--val_embeddings_path",
+        type=str,
+        default="",
+        help=(
+            "Optional: separate validation embeddings path. If set together with "
+            "--val_labels_file, this directory/file will be used as validation set "
+            "instead of splitting --embeddings_path by --val_fraction."
+        ),
+    )
+    p.add_argument(
+        "--val_labels_file",
+        type=str,
+        default="",
+        help=(
+            "Optional: validation labels file or directory corresponding to "
+            "--val_embeddings_path."
         ),
     )
     p.add_argument(
@@ -1497,8 +2091,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--ignore_index",
         type=int,
-        default=19,
-        help="Label index to ignore in loss (e.g., 'Void label' = 19)",
+        default=255,
+        help="Label index to ignore in loss (e.g., 'Void label' = 255)",
     )
     p.add_argument(
         "--background_index",
@@ -1733,6 +2327,30 @@ def parse_args() -> argparse.Namespace:
         help="Label smoothing for CrossEntropyLoss (default 0.05)",
     )
     p.add_argument(
+        "--focal_gamma",
+        type=float,
+        default=2.0,
+        help="Gamma for focal loss (default 2.0)",
+    )
+    p.add_argument(
+        "--focal_class_weights",
+        type=str,
+        default="",
+        help=(
+            "Optional comma-separated per-class weights for focal loss, "
+            "e.g. '1,3,1' for classes 0..C-1 (default none)."
+        ),
+    )
+    p.add_argument(
+        "--focal_focus_classes",
+        type=str,
+        default="all_fg",
+        help=(
+            "Classes used by focal pixel sampling. Use 'all_fg' (default), 'all', "
+            "or comma-separated indices like '1,2,3,4,5,6,7,8'."
+        ),
+    )
+    p.add_argument(
         "--class_weight_min",
         type=float,
         default=0.2,
@@ -1787,7 +2405,7 @@ def parse_args() -> argparse.Namespace:
         default=42,
         help="Random seed for train/val split and reproducibility (default 42)",
     )
-    return p.parse_args()
+    return p.parse_args(argv)
 
 
 def main() -> None:

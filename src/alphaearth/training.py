@@ -74,7 +74,7 @@ class Trainer:
         if self.text_adapter is not None and any(p.requires_grad for p in self.text_adapter.parameters()):
             params += [p for p in self.text_adapter.parameters() if p.requires_grad]
         self.optim = torch.optim.Adam(params, lr=lr)
-        self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
+        self.scaler = torch.amp.GradScaler('cuda', enabled=self.use_amp)
         self.output_dir = output_dir
         self.max_steps = 1000
         self.warmup_steps = 0
@@ -412,34 +412,39 @@ class Trainer:
                     self.optim.step()
                     self.optim.zero_grad(set_to_none=True)
 
+            def _to_float(x: Any) -> float:
+                if isinstance(x, torch.Tensor):
+                    return float(x.detach().item())
+                return float(x)
+
             self.loss_history['steps'].append(step)
-            self.loss_history['total'].append(float(loss))
-            self.loss_history['reconstruction'].append(float(losses.get('reconstruction', torch.tensor(0.0))))
-            self.loss_history['detail'].append(float(losses.get('detail', torch.tensor(0.0))))
-            self.loss_history['ssim'].append(float(losses.get('ssim', torch.tensor(0.0))))
-            self.loss_history['highfreq'].append(float(losses.get('highfreq', torch.tensor(0.0))))
-            self.loss_history['uniformity'].append(float(losses.get('uniformity', torch.tensor(0.0))))
-            self.loss_history['consistency'].append(float(losses.get('consistency', torch.tensor(0.0))))
-            self.loss_history['clip'].append(float(losses.get('clip', torch.tensor(0.0))))
-            self.loss_history['granularity'].append(float(losses.get('granularity', torch.tensor(0.0))))
+            self.loss_history['total'].append(_to_float(loss))
+            self.loss_history['reconstruction'].append(_to_float(losses.get('reconstruction', 0.0)))
+            self.loss_history['detail'].append(_to_float(losses.get('detail', 0.0)))
+            self.loss_history['ssim'].append(_to_float(losses.get('ssim', 0.0)))
+            self.loss_history['highfreq'].append(_to_float(losses.get('highfreq', 0.0)))
+            self.loss_history['uniformity'].append(_to_float(losses.get('uniformity', 0.0)))
+            self.loss_history['consistency'].append(_to_float(losses.get('consistency', 0.0)))
+            self.loss_history['clip'].append(_to_float(losses.get('clip', 0.0)))
+            self.loss_history['granularity'].append(_to_float(losses.get('granularity', 0.0)))
             
-            recon_loss = float(losses.get('reconstruction', torch.tensor(0.0)))
+            recon_loss = _to_float(losses.get('reconstruction', 0.0))
             pbar.set_postfix({
                 'recon_loss': f'{recon_loss:.4f}',
-                'total_loss': f'{float(loss):.4f}'
+                'total_loss': f'{_to_float(loss):.4f}'
             })
             
             if step % log_every == 0:
-                recon = float(losses.get('reconstruction', torch.tensor(0.0)))
-                recon_wmean = float(losses.get('reconstruction_weighted_mean', torch.tensor(0.0)))
-                detail = float(losses.get('detail', torch.tensor(0.0)))
-                ssim = float(losses.get('ssim', torch.tensor(0.0)))
-                highfreq = float(losses.get('highfreq', torch.tensor(0.0)))
-                uni = float(losses.get('uniformity', torch.tensor(0.0)))
-                cons = float(losses.get('consistency', torch.tensor(0.0)))
-                clip = float(losses.get('clip', torch.tensor(0.0)))
-                gran = float(losses.get('granularity', torch.tensor(0.0)))
-                tgt_valid = float(target_valid_ratio)
+                recon = _to_float(losses.get('reconstruction', 0.0))
+                recon_wmean = _to_float(losses.get('reconstruction_weighted_mean', 0.0))
+                detail = _to_float(losses.get('detail', 0.0))
+                ssim = _to_float(losses.get('ssim', 0.0))
+                highfreq = _to_float(losses.get('highfreq', 0.0))
+                uni = _to_float(losses.get('uniformity', 0.0))
+                cons = _to_float(losses.get('consistency', 0.0))
+                clip = _to_float(losses.get('clip', 0.0))
+                gran = _to_float(losses.get('granularity', 0.0))
+                tgt_valid = _to_float(target_valid_ratio)
                 s1 = losses.get('recon_src_sentinel1')
                 s2 = losses.get('recon_src_sentinel2')
                 l8 = losses.get('recon_src_landsat')
@@ -450,14 +455,14 @@ class Trainer:
                 eta_hours = eta_seconds / 3600
                 source_msg = []
                 if s1 is not None:
-                    source_msg.append(f"s1 {float(s1):.4f}")
+                    source_msg.append(f"s1 {_to_float(s1):.4f}")
                 if s2 is not None:
-                    source_msg.append(f"s2 {float(s2):.4f}")
+                    source_msg.append(f"s2 {_to_float(s2):.4f}")
                 if l8 is not None:
-                    source_msg.append(f"l8 {float(l8):.4f}")
+                    source_msg.append(f"l8 {_to_float(l8):.4f}")
                 source_suffix = f" | {' | '.join(source_msg)}" if source_msg else ""
                 print(f"\nstep {step:05d}/{steps:05d} ({step/steps*100:.1f}%) | "
-                    f"total {float(loss):.4f} | recon {recon:.4f} | recon_wmean {recon_wmean:.4f} | detail {detail:.4f} | ssim {ssim:.4f} | hf {highfreq:.4f} | uni {uni:.4f} | cons {cons:.4f} | gran {gran:.4f} | clip {clip:.4f} | tgt_valid {tgt_valid:.3f}{source_suffix} | "
+                    f"total {_to_float(loss):.4f} | recon {recon:.4f} | recon_wmean {recon_wmean:.4f} | detail {detail:.4f} | ssim {ssim:.4f} | hf {highfreq:.4f} | uni {uni:.4f} | cons {cons:.4f} | gran {gran:.4f} | clip {clip:.4f} | tgt_valid {tgt_valid:.3f}{source_suffix} | "
                         f"w_uni {self.loss_fn.uniformity_weight:.4f} | w_cons {self.loss_fn.consistency_weight:.4f} | w_gran {self.loss_fn.granularity_weight:.4f} | "
                       f"ETA: {eta_hours:.2f}h ({steps_per_sec:.2f} steps/s)")
             
@@ -486,7 +491,29 @@ class Trainer:
             raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
 
         checkpoint = torch.load(ckpt_path, map_location=self.device)
-        load_result = self.model.load_state_dict(checkpoint['model_state_dict'], strict=strict)
+        if strict:
+            load_result = self.model.load_state_dict(checkpoint['model_state_dict'], strict=True)
+        else:
+            model_state = self.model.state_dict()
+            ckpt_state = checkpoint['model_state_dict']
+            filtered_state = {}
+            mismatched = []
+
+            for key, value in ckpt_state.items():
+                if key not in model_state:
+                    continue
+                if model_state[key].shape != value.shape:
+                    mismatched.append((key, tuple(value.shape), tuple(model_state[key].shape)))
+                    continue
+                filtered_state[key] = value
+
+            if mismatched:
+                print("Warning: skipping checkpoint params with shape mismatch:")
+                for key, ckpt_shape, model_shape in mismatched:
+                    print(f"  - {key}: checkpoint {ckpt_shape} != model {model_shape}")
+
+            load_result = self.model.load_state_dict(filtered_state, strict=False)
+
         if not strict:
             if getattr(load_result, 'unexpected_keys', None):
                 print(

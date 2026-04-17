@@ -12,18 +12,25 @@ class GEEMultiSourceDataset(Dataset):
         self,
         data_dir: str,
         patch_size: int = 256,
+        max_time_steps: int = 0,
         normalize: bool = True,
     ) -> None:
         self.data_dir = Path(data_dir)
         self.patch_size = patch_size
+        self.max_time_steps = max(0, int(max_time_steps))
         self.normalize = normalize
 
         if not self.data_dir.exists():
             raise FileNotFoundError(f"Data directory not found: {self.data_dir}")
 
+        # 默认优先使用标准命名 sample_XXXXX.npz；若不存在则回退到所有 .npz
         self.files = sorted(self.data_dir.glob("sample_*.npz"))
         if not self.files:
-            raise FileNotFoundError(f"No sample_*.npz files found in {self.data_dir}")
+            self.files = sorted(self.data_dir.glob("*.npz"))
+        if not self.files:
+            raise FileNotFoundError(
+                f"No .npz sample files found in {self.data_dir} (expected sample_*.npz or *.npz)."
+            )
 
         # 自动检测实际存在的数据源，兼容仅 S1/S2 或 L8/S1/S2 等多种组合
         detected_sources: List[str] = []
@@ -163,10 +170,19 @@ class GEEMultiSourceDataset(Dataset):
                     raise ValueError(f"Source {src} must have shape (T, H, W, C), got {arr.shape}")
                 arr = self._resize_spatial(arr)
                 T_src, H_src, W_src, _ = arr.shape
+
+                # Keep latest observations to cap memory during training.
+                if self.max_time_steps > 0 and T_src > self.max_time_steps:
+                    arr = arr[-self.max_time_steps:]
+                    T_src = arr.shape[0]
+
                 arrays[src] = arr
                 frame_valid[src] = self._frame_valid_mask(arr)
                 T_list.append(T_src)
                 H, W = H_src, W_src
+
+            if self.max_time_steps > 0 and timestamps.shape[0] > self.max_time_steps:
+                timestamps = timestamps[-self.max_time_steps:]
 
         T = int(max(T_list))
 
@@ -225,12 +241,14 @@ def create_gee_multisource_dataloader(
     batch_size: int = 4,
     num_workers: int = 4,
     patch_size: int = 256,
+    max_time_steps: int = 0,
     normalize: bool = True,
     shuffle: bool = True,
 ) -> DataLoader:
     dataset = GEEMultiSourceDataset(
         data_dir=data_dir,
         patch_size=patch_size,
+        max_time_steps=max_time_steps,
         normalize=normalize,
     )
 

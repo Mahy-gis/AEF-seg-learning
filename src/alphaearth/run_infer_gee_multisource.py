@@ -108,7 +108,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Optional cap on number of timestamps per sample when using "
-            "'per_timestamp' summary_strategy. If set, only the first N time steps are used."
+            "inference. If set, only the first N time steps are used."
         ),
     )
     return parser.parse_args()
@@ -245,6 +245,11 @@ def run_inference(args: argparse.Namespace) -> None:
             if src not in selected_sources:
                 x = torch.zeros_like(x)
 
+            if args.max_time_steps is not None and args.max_time_steps > 0:
+                t_eff = min(x.shape[1], args.max_time_steps)
+                x = x[:, :t_eff]
+                ts = ts[:, :t_eff]
+
             source_data[src] = x
             timestamps[src] = ts
 
@@ -263,7 +268,18 @@ def run_inference(args: argparse.Namespace) -> None:
         global_idx = 0
         for batch_idx, batch in enumerate(dataloader):
             source_data, timestamps = build_model_inputs(batch)
-            valid_periods = batch["valid_periods"]
+            if args.max_time_steps is not None and args.max_time_steps > 0:
+                reference_source = selected_sources[0]
+                ts_ref = timestamps[reference_source]
+                valid_periods = [
+                    (
+                        float(ts_ref[i, 0].item()) if ts_ref.shape[1] > 0 else 0.0,
+                        float(ts_ref[i, -1].item()) if ts_ref.shape[1] > 0 else 0.0,
+                    )
+                    for i in range(ts_ref.shape[0])
+                ]
+            else:
+                valid_periods = batch["valid_periods"]
 
             out: Dict[str, Any] = model(
                 source_data=source_data,

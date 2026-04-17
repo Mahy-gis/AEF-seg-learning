@@ -9,16 +9,16 @@ from alphaearth.training import create_trainer
 from alphaearth.data_gee_multisource import create_gee_multisource_dataloader
 
 
-def parse_reconstruction_sources(value: str) -> list[str]:
+def parse_source_list(value: str) -> list[str]:
     sources = [item.strip() for item in value.split(",") if item.strip()]
     if not sources:
-        raise argparse.ArgumentTypeError("At least one reconstruction source is required")
+        raise argparse.ArgumentTypeError("At least one source is required")
 
     allowed = {"landsat", "sentinel1", "sentinel2"}
     invalid = [item for item in sources if item not in allowed]
     if invalid:
         raise argparse.ArgumentTypeError(
-            f"Unsupported reconstruction sources: {invalid}. Allowed values: {sorted(allowed)}"
+            f"Unsupported sources: {invalid}. Allowed values: {sorted(allowed)}"
         )
     return sources
 
@@ -54,6 +54,12 @@ def main() -> None:
         type=int,
         default=128,
         help="Spatial patch size (H, W)",
+    )
+    parser.add_argument(
+        "--max_time_steps",
+        type=int,
+        default=0,
+        help="Maximum time steps per sample after loading (0 means keep all).",
     )
     parser.add_argument(
         "--max_steps",
@@ -193,13 +199,22 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--input_sources",
+        type=parse_source_list,
+        default=["landsat", "sentinel1", "sentinel2"],
+        help=(
+            "Comma-separated list of sources used as encoder inputs. "
+            "Use 'sentinel1,sentinel2' to exclude Landsat from model input."
+        ),
+    )
+    parser.add_argument(
         "--reconstruction_sources",
-        type=parse_reconstruction_sources,
+        type=parse_source_list,
         default=["landsat", "sentinel1", "sentinel2"],
         help=(
             "Comma-separated list of sources to reconstruct. "
-            "By default all three sources are reconstructed, while Landsat/S1/S2 are always concatenated "
-            "as encoder inputs before STP processing."
+            "By default all three sources are reconstructed. "
+            "Encoder inputs are controlled separately by --input_sources."
         ),
     )
     parser.add_argument(
@@ -267,6 +282,7 @@ def main() -> None:
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         patch_size=args.patch_size,
+        max_time_steps=args.max_time_steps,
         normalize=True,
         shuffle=True,
     )
@@ -291,6 +307,19 @@ def main() -> None:
 
     print(f"Available sources in dataset: {available_sources}")
 
+    input_sources: Dict[str, int] = {}
+    for name in args.input_sources:
+        if name in channel_map:
+            input_sources[name] = channel_map[name]
+        else:
+            print(f"Warning: requested input source '{name}' not present in dataset; ignoring.")
+
+    if not input_sources:
+        raise ValueError(
+            "None of the requested input_sources are present in the dataset. "
+            "Please check --input_sources and the GEE samples."
+        )
+
     decode_sources: Dict[str, int] = {}
     for name in args.reconstruction_sources:
         if name in channel_map:
@@ -306,7 +335,7 @@ def main() -> None:
 
     model = AlphaEarthFoundations(
         model_size=args.model_size,
-        input_sources=channel_map,
+        input_sources=input_sources,
         decode_sources=decode_sources,
     )
     model.encoder.use_gradient_checkpointing = bool(args.grad_checkpoint)

@@ -4,6 +4,7 @@ from einops import rearrange
 import torch
 import torch.nn as nn
 from torch.functional import F
+import warnings
 
 """
 AEF loss = Reconstruction loss + Uniformity loss + Consistency loss + Text loss
@@ -52,6 +53,25 @@ class AEFLoss:
             for source_name, weight in source_weights.items():
                 if source_name in self.source_configs:
                     self.source_configs[source_name]['weight'] = float(weight)
+
+    def _assert_finite(self, name: str, value: torch.Tensor) -> None:
+        """Raise with context if a loss term becomes NaN/Inf.
+
+        This helps quickly pinpoint which component (reconstruction/ssim/etc.)
+        first产生数值问题，而不是整条训练曲线在若干 step 之后全部变成 NaN。
+        """
+        if not torch.is_tensor(value):
+            return
+        if not torch.isfinite(value).all():
+            # 尽量打印出标量值，便于在日志中排查。
+            try:
+                scalar = float(value.detach().cpu().reshape(-1)[0])
+            except Exception:
+                scalar = None
+            msg = f"Loss term '{name}' became non-finite (NaN/Inf)."
+            if scalar is not None:
+                msg += f" Example value: {scalar}"
+            raise RuntimeError(msg)
 
     def _masked_regression_loss(
         self,
@@ -478,6 +498,13 @@ class AEFLoss:
             losses['detail'] = torch.tensor(0.0)
             losses['ssim'] = torch.tensor(0.0)
             losses['highfreq'] = torch.tensor(0.0)
+
+        # 数值稳定性检查：一旦任一重建相关 loss 出现 NaN/Inf，立刻报错停止训练。
+        self._assert_finite('reconstruction', losses['reconstruction'])
+        self._assert_finite('reconstruction_weighted_mean', losses['reconstruction_weighted_mean'])
+        self._assert_finite('detail', losses['detail'])
+        self._assert_finite('ssim', losses['ssim'])
+        self._assert_finite('highfreq', losses['highfreq'])
         
         if 'embeddings' in outputs:
             uniformity_loss = self.batch_uniformity_loss(outputs['embeddings'])
@@ -485,14 +512,27 @@ class AEFLoss:
         else:
             losses['uniformity'] = torch.tensor(0.0, device=next(iter(outputs.values())).device if outputs else 'cpu')
 
-        if 'teacher_embeddings' in outputs and 'student_embeddings' in outputs:
-            consistency_loss = self.consistency_loss(
+        self._assert_finite('uniformity', losses['uniformity'])
+
+        if self.consistency_weight > 0.0 and 'teacher_embeddings' in outputs and 'student_embeddings' in outputs:
+            raw_consistency = self.consistency_loss(
                 outputs['teacher_embeddings'],
                 outputs['student_embeddings']
             )
-            losses['consistency'] = consistency_loss
+            if torch.isfinite(raw_consistency).all():
+                losses['consistency'] = raw_consistency
+            else:
+                warnings.warn(
+                    "Consistency loss produced non-finite values; "
+                    "setting it to 0 for this step and skipping gradient for the student branch.",
+                    RuntimeWarning,
+                )
+                losses['consistency'] = torch.tensor(0.0, device=losses['reconstruction'].device)
         else:
+            # 当权重为 0 或缺失任一 embedding 时，直接跳过一致性项
             losses['consistency'] = torch.tensor(0.0, device=losses['reconstruction'].device)
+
+        self._assert_finite('consistency', losses['consistency'])
         
         if 'image_embeddings' in outputs and 'text_embeddings' in outputs:
             clip_loss = self.clip_loss(
@@ -508,6 +548,8 @@ class AEFLoss:
         else:
             losses['granularity'] = torch.tensor(0.0, device=losses['reconstruction'].device)
         
+        self._assert_finite('granularity', losses['granularity'])
+
         total_loss = (
             self.reconstruction_weight * losses['reconstruction'] +
             self.detail_weight * losses['detail'] +
@@ -518,6 +560,8 @@ class AEFLoss:
             self.text_weight * losses['clip'] +
             self.granularity_weight * losses['granularity']
         )
+
+        self._assert_finite('total', total_loss)
         
         losses['total'] = total_loss
         

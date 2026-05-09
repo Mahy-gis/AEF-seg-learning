@@ -1,0 +1,102 @@
+input:
+  mode: embedding   # embedding | raw
+
+labels:
+  num_classes: 20
+  ignore_index: 19
+  background_index: 0
+  ignore_background_in_metrics: true
+  ignore_background_in_dice: true
+
+model:
+  variant: basic    # basic | resse | lightweight | aspp
+  depth: 4
+  base_channels: 32
+  norm: group
+  dropout: 0.1
+
+train:
+  epochs: 200
+  batch_size: 16
+  num_workers: 8
+  persistent_workers: true
+  prefetch_factor: 4
+  val_interval: 1
+  lr: 5e-5
+  weight_decay: 1e-4
+  seed: 42
+  val_fraction: 0.2
+  early_stop_patience: 0
+  scheduler_monitor: val_miou
+  lr_patience: 5
+  lr_decay_factor: 0.5
+  min_lr: 1e-6
+  validate_first_epoch: false
+
+  dice_weight: 0.4
+  ce_weight: 0.2
+  fg_aux_weight: 0.1
+  bg_ratio_weight: 0.05
+  focal_gamma: 2.0
+  focal_class_weights: "0.200,0.761,2.306,1.101,0.286,0.556,0.403,2.539,0.210,2.542,0.247,1.494,0.514,1.366,0.380,1.212,0.303,0.587,0.315"
+  focal_focus_classes: all
+
+  save_val_samples: 0
+
+data:
+  resample_size: 0
+  normalize_features: true
+  feature_stats_max_samples: 0
+
+  enable_augmentation: true
+  train_repeat_factor: 2
+  aug_flip_prob: 0.5
+  aug_rot90_prob: 0.5
+  aug_noise_std: 0.01
+  aug_gain_std: 0.05
+  train_crop_size: 128
+  fg_crop_prob: 0.5
+  use_fg_sampler: true
+  fg_sampler_power: 1.5
+  fg_sampler_min_weight: 0.2
+
+runtime:
+  device: cuda:0
+  output_dir: /mnt/data/mhy/RSFM/AEF-seg-learning/data/Pastis-R/result/outputs_aef
+  resume: false
+  resume_checkpoint: ""
+  resume_strict: true
+  amp: true
+  cudnn_benchmark: true
+  allow_tf32: true
+  channels_last: true
+  pin_memory: true
+  matmul_precision: high
+
+# embedding 模式数据路径
+embedding:
+  embedding_key: embeddings
+  per_patch_labels: false
+  train_embeddings_path: /mnt/data/mhy/RSFM/AEF-seg-learning/data/Pastis-R/embedding/AEF_npz/train
+  train_labels_path: /mnt/data/mhy/RSFM/AEF-seg-learning/data/Pastis-R/label/train
+  val_embeddings_path: /mnt/data/mhy/RSFM/AEF-seg-learning/data/Pastis-R/embedding/AEF_npz/val
+  val_labels_path: /mnt/data/mhy/RSFM/AEF-seg-learning/data/Pastis-R/label/val
+
+# raw 模式数据路径（input.mode=raw 时使用）
+raw:
+  dataset_root: /mnt/data/mhy/dataset/PASTIS-R/raw
+  label_root: /mnt/data/mhy/RSFM/AEF-seg-learning/data/Pastis-R/label
+  train_split: train
+  val_split: val
+  s1_key: sentinel1
+  s2_key: sentinel2
+  label_key: labels
+  time_steps: 12
+
+# 可选：自动网格搜索（先手动可置 false）
+search:
+  enabled: false
+  grid:
+    train.lr: [1e-6, 1e-4]
+    model.base_channels: [4, 8]
+    train.dice_weight: [0.3, 0.4]

@@ -1,4 +1,6 @@
 import argparse
+import csv
+import json
 from pathlib import Path
 from typing import Tuple, List, Optional
 import re
@@ -13,16 +15,20 @@ import matplotlib.pyplot as plt
 # ---------- Data preparation helpers ----------
 
 
-def prepare_features_from_embeddings(emb_npz: Path, embedding_key: str = "auto") -> np.ndarray:
-    """Load embeddings npz and return features as (C,H,W) float32.
+def prepare_features_from_embeddings(emb_npy: Path, embedding_key: str = "auto") -> np.ndarray:
+    """Load embeddings from .npy and return features as (C,H,W) float32.
 
     Supports two formats:
       - embeddings: (H,W,64)
       - embeddings_per_time: (T,H,W,64) -> (T*64,H,W)
     """
-    data = np.load(emb_npz, allow_pickle=True)
+    data = np.load(emb_npy, allow_pickle=True)
 
-    # Also support plain .npy embeddings in addition to .npz containers.
+    # np.save(dict) -> .npy is loaded as 0-d object array; unwrap to mapping-like object.
+    if isinstance(data, np.ndarray) and data.dtype == object and data.shape == ():
+        data = data.item()
+
+    # Support plain .npy embeddings saved as either arrays or dict-like object arrays.
     if isinstance(data, np.ndarray):
         e = data
         if e.ndim == 4:
@@ -32,7 +38,7 @@ def prepare_features_from_embeddings(emb_npz: Path, embedding_key: str = "auto")
             elif e.shape[1] == 64:
                 e_chw = e
             else:
-                raise ValueError(f"Unexpected ndarray embedding shape {e.shape} in {emb_npz}")
+                raise ValueError(f"Unexpected ndarray embedding shape {e.shape} in {emb_npy}")
             T, C, H, W = e_chw.shape
             feats = e_chw.reshape(T * C, H, W)
         elif e.ndim == 3:
@@ -42,43 +48,91 @@ def prepare_features_from_embeddings(emb_npz: Path, embedding_key: str = "auto")
             else:
                 feats = e
         else:
-            raise ValueError(f"Unsupported ndarray embedding ndim={e.ndim} in {emb_npz}")
+            raise ValueError(f"Unsupported ndarray embedding ndim={e.ndim} in {emb_npy}")
         return feats.astype(np.float32)
 
-    if embedding_key != "auto":
+    if isinstance(data, dict):
+        if embedding_key != "auto":
+            if embedding_key not in data:
+                raise ValueError(f"Embedding key '{embedding_key}' not found in {emb_npy}")
+            e = data[embedding_key]
+            if e.ndim == 4:
+                if e.shape[-1] != 64:
+                    raise ValueError(f"Unexpected {embedding_key} shape {e.shape} in {emb_npy}")
+                e_chw = np.transpose(e, (0, 3, 1, 2))
+                T, C, H, W = e_chw.shape
+                feats = e_chw.reshape(T * C, H, W)
+            elif e.ndim == 3:
+                if e.shape[-1] != 64:
+                    raise ValueError(f"Unexpected {embedding_key} shape {e.shape} in {emb_npy}")
+                feats = np.transpose(e, (2, 0, 1))
+            else:
+                raise ValueError(f"Unsupported {embedding_key} ndim={e.ndim} in {emb_npy}")
+        elif "embeddings_per_time" in data:
+            e = data["embeddings_per_time"]  # (T,H,W,64)
+            if e.ndim != 4 or e.shape[-1] != 64:
+                raise ValueError(f"Unexpected embeddings_per_time shape {e.shape} in {emb_npy}")
+            e_chw = np.transpose(e, (0, 3, 1, 2))  # (T,64,H,W)
+            T, C, H, W = e_chw.shape
+            feats = e_chw.reshape(T * C, H, W)
+        elif "embeddings" in data:
+            e = data["embeddings"]  # (H,W,64)
+            if e.ndim != 3 or e.shape[-1] != 64:
+                raise ValueError(f"Unexpected embeddings shape {e.shape} in {emb_npy}")
+            feats = np.transpose(e, (2, 0, 1))  # (64,H,W)
+        elif "embeddings_native" in data:
+            e = data["embeddings_native"]  # typically (H,W,64), e.g. 64x64 native map
+            if e.ndim != 3 or e.shape[-1] != 64:
+                raise ValueError(f"Unexpected embeddings_native shape {e.shape} in {emb_npy}")
+            feats = np.transpose(e, (2, 0, 1))  # (64,H,W)
+        else:
+            raise ValueError(
+                f"None of 'embeddings_per_time'/'embeddings'/'embeddings_native' found in {emb_npy}"
+            )
+    elif embedding_key != "auto":
         if embedding_key not in data:
-            raise ValueError(f"Embedding key '{embedding_key}' not found in {emb_npz}")
+            raise ValueError(f"Embedding key '{embedding_key}' not found in {emb_npy}")
         e = data[embedding_key]
         if e.ndim == 4:
             if e.shape[-1] != 64:
-                raise ValueError(f"Unexpected {embedding_key} shape {e.shape} in {emb_npz}")
+                raise ValueError(f"Unexpected {embedding_key} shape {e.shape} in {emb_npy}")
             e_chw = np.transpose(e, (0, 3, 1, 2))
             T, C, H, W = e_chw.shape
             feats = e_chw.reshape(T * C, H, W)
         elif e.ndim == 3:
             if e.shape[-1] != 64:
-                raise ValueError(f"Unexpected {embedding_key} shape {e.shape} in {emb_npz}")
+                raise ValueError(f"Unexpected {embedding_key} shape {e.shape} in {emb_npy}")
             feats = np.transpose(e, (2, 0, 1))
         else:
-            raise ValueError(f"Unsupported {embedding_key} ndim={e.ndim} in {emb_npz}")
+            raise ValueError(f"Unsupported {embedding_key} ndim={e.ndim} in {emb_npy}")
     elif "embeddings_per_time" in data:
         e = data["embeddings_per_time"]  # (T,H,W,64)
         if e.ndim != 4 or e.shape[-1] != 64:
-            raise ValueError(f"Unexpected embeddings_per_time shape {e.shape} in {emb_npz}")
+            raise ValueError(f"Unexpected embeddings_per_time shape {e.shape} in {emb_npy}")
         e_chw = np.transpose(e, (0, 3, 1, 2))  # (T,64,H,W)
         T, C, H, W = e_chw.shape
         feats = e_chw.reshape(T * C, H, W)
     elif "embeddings" in data:
         e = data["embeddings"]  # (H,W,64)
         if e.ndim != 3 or e.shape[-1] != 64:
-            raise ValueError(f"Unexpected embeddings shape {e.shape} in {emb_npz}")
+            raise ValueError(f"Unexpected embeddings shape {e.shape} in {emb_npy}")
+        feats = np.transpose(e, (2, 0, 1))  # (64,H,W)
+    elif "embeddings_native" in data:
+        e = data["embeddings_native"]  # typically (H,W,64), e.g. 64x64 native map
+        if e.ndim != 3 or e.shape[-1] != 64:
+            raise ValueError(f"Unexpected embeddings_native shape {e.shape} in {emb_npy}")
         feats = np.transpose(e, (2, 0, 1))  # (64,H,W)
     else:
         raise ValueError(
-            f"Neither 'embeddings_per_time' nor 'embeddings' found in {emb_npz}"
+            f"None of 'embeddings_per_time'/'embeddings'/'embeddings_native' found in {emb_npy}"
         )
 
-    return feats.astype(np.float32)
+    # Robustness: some AEF tiles may contain sparse NaNs after reprojection.
+    # Replace non-finite values so normalization/loss computation stays stable.
+    feats = feats.astype(np.float32, copy=False)
+    if not np.isfinite(feats).all():
+        feats = np.nan_to_num(feats, nan=0.0, posinf=0.0, neginf=0.0)
+    return feats
 
 
 def resize_labels_to(features: np.ndarray, labels: np.ndarray) -> np.ndarray:
@@ -95,6 +149,54 @@ def resize_labels_to(features: np.ndarray, labels: np.ndarray) -> np.ndarray:
     return t.squeeze(0).squeeze(0).numpy().astype(labels.dtype)
 
 
+def load_label_mask_from_file(label_file: Path, label_key: str = "labels") -> np.ndarray:
+    """Load a 2D label mask from .npy/.npz files.
+
+    Supports plain 2D arrays as well as object payloads that wrap a dict with a
+    ``labels`` entry, which is the format used by the PASTIS-R per-patch files.
+    """
+    if label_file.suffix.lower() == ".npz":
+        with np.load(label_file, allow_pickle=True) as label_npz:
+            if label_key in label_npz:
+                labels = label_npz[label_key]
+            elif "labels" in label_npz:
+                labels = label_npz["labels"]
+            else:
+                available = list(label_npz.keys())
+                if len(available) == 1:
+                    labels = label_npz[available[0]]
+                else:
+                    raise KeyError(
+                        f"Label key '{label_key}' not found in {label_file}. Available keys: {available}"
+                    )
+    else:
+        labels_raw = np.load(label_file, allow_pickle=True)
+        if isinstance(labels_raw, np.ndarray) and labels_raw.dtype == object and labels_raw.shape == ():
+            labels_obj = labels_raw.item()
+            if isinstance(labels_obj, dict):
+                if label_key in labels_obj:
+                    labels = labels_obj[label_key]
+                elif "labels" in labels_obj:
+                    labels = labels_obj["labels"]
+                else:
+                    available = list(labels_obj.keys())
+                    if len(available) == 1:
+                        labels = labels_obj[available[0]]
+                    else:
+                        raise KeyError(
+                            f"Label key '{label_key}' not found in {label_file}. Available keys: {available}"
+                        )
+            else:
+                labels = labels_obj
+        else:
+            labels = labels_raw
+
+    labels_np = np.asarray(labels).squeeze()
+    if labels_np.ndim != 2:
+        raise ValueError(f"Expected 2D label in {label_file}, got shape {labels_np.shape}")
+    return labels_np
+
+
 def resize_features_to(features: np.ndarray, out_h: int, out_w: int) -> np.ndarray:
     """Resize features (C,H,W) to exact target size using bilinear interpolation."""
     _, h, w = features.shape
@@ -109,17 +211,17 @@ class EmbeddingSegmentationDataset(Dataset):
     """Segmentation dataset from AEF embeddings and integer labels.
 
     Supports two modes:
-      - Single-sample: embeddings_path is a file (one npz) -> len=1.
-      - Multi-sample: embeddings_path is a directory -> all *.npz inside
-        (e.g., embedding_timeseries_*.npz) are treated as separate samples.
+      - Single-sample: embeddings_path is a file (one .npy) -> len=1.
+      - Multi-sample: embeddings_path is a directory -> all *.npy inside
+        are treated as separate samples.
 
-    In both cases, labels_npz provides a (H,W) label mask which is resized
+    In both cases, labels provide a (H,W) label mask which is resized
     to each sample's spatial resolution as needed.
 
     Optionally, when per_patch_labels=True, labels_path is treated as a
     directory containing per-patch label files whose names follow the
-    pattern ParcelIDs_XXXXX_labels.npz, and embeddings are named
-    embedding_XXXXX*.npz (or any name ending with the same numeric XXXXX).
+    pattern ParcelIDs_XXXXX.npy, and embeddings are named
+    embedding_XXXXX*.npy (or any name ending with the same numeric XXXXX).
     """
     def __init__(
         self,
@@ -133,7 +235,7 @@ class EmbeddingSegmentationDataset(Dataset):
         self.per_patch_labels = per_patch_labels
         self.embedding_key = embedding_key
         self.resample_size = max(0, int(resample_size))
-        # 可选：用于“按索引一一对应”的标签模式（例如 embedding_0000.npz ↔ 20250413_000_label.npy）。
+        # 可选：用于“按索引一一对应”的标签模式（例如 embedding_0000.npy ↔ 20250413_000_label.npy）。
         self.index_label_files: Optional[List[Path]] = None
 
         if per_patch_labels:
@@ -144,12 +246,11 @@ class EmbeddingSegmentationDataset(Dataset):
             self.labels_dir = labels_path
             self.labels_np = None
         else:
+            if labels_path.suffix.lower() != ".npy":
+                raise ValueError(f"Labels must be a .npy file, got {labels_path}")
+
             # Load a single global label mask once; will be resized per-sample if needed.
-            data = np.load(labels_path, allow_pickle=True)
-            if isinstance(data, np.lib.npyio.NpzFile) and "labels" in data:
-                labels = data["labels"]
-            else:
-                labels = data  # assume npy directly
+            labels = np.load(labels_path, allow_pickle=True)
 
             if labels.ndim != 2:
                 raise ValueError(f"Expected labels with shape (H,W), got {labels.shape}")
@@ -157,22 +258,17 @@ class EmbeddingSegmentationDataset(Dataset):
             self.labels_dir = None
 
         if embeddings_path.is_dir():
-            # Collect all embedding files under the directory.
-            self.files: List[Path] = sorted(
-                [
-                    p
-                    for ext in ("*.npz", "*.npy")
-                    for p in embeddings_path.glob(ext)
-                    if p.is_file()
-                ]
-            )
+            # Collect only .npy embedding files.
+            self.files = sorted([p for p in embeddings_path.glob("*.npy") if p.is_file()])
             if not self.files:
                 raise FileNotFoundError(
-                    f"No embedding files (.npz/.npy) found in embeddings directory {embeddings_path}"
+                    f"No embedding files (.npy) found in embeddings directory {embeddings_path}"
                 )
         else:
             if not embeddings_path.exists():
-                raise FileNotFoundError(f"Embeddings npz not found: {embeddings_path}")
+                raise FileNotFoundError(f"Embeddings npy not found: {embeddings_path}")
+            if embeddings_path.suffix.lower() != ".npy":
+                raise ValueError(f"Embeddings must be a .npy file, got {embeddings_path}")
             self.files = [embeddings_path]
 
         # 若是 per-patch 模式，但标签文件名并非 sample_*/ParcelIDs_*，
@@ -206,10 +302,10 @@ class EmbeddingSegmentationDataset(Dataset):
             else:
                 # 默认 Per-patch 模式：根据 embedding 文件名推断对应的标签文件。
                 # 兼容主要组织方式：
-                #   1) 原始示例：embedding_XXXXX*.npz  <-> ParcelIDs_XXXXX_labels.npz
-                #   2) 本项目当前数据：embedding_XXXXXX_YY.npz <-> sample_XXXXXX_YY_label.(npz|npy)
-                #   3) MTS12 AEF：eopath_ID_COL_ROW.npy <-> ParcelIDs_ID_labels.npz
-                #   4) PASTIS-R 常见命名：embedding_XXXXX.npz <-> ParcelIDs_XXXXX.npy
+                #   1) 原始示例：embedding_XXXXX*.npy  <-> ParcelIDs_XXXXX_labels.npy
+                #   2) 本项目当前数据：embedding_XXXXXX_YY.npy <-> sample_XXXXXX_YY_label.npy
+                #   3) MTS12 AEF：eopath_ID_COL_ROW.npy <-> ParcelIDs_ID.npy
+                #   4) PASTIS-R 常见命名：embedding_XXXXX.npy <-> ParcelIDs_XXXXX.npy
                 stem = emb_file.stem  # e.g., "embedding_00241_00"
 
                 # 先去掉前缀 "embedding_"，保留完整 patch id（如 "00241_00"、"126582_37" 等）。
@@ -220,25 +316,24 @@ class EmbeddingSegmentationDataset(Dataset):
                 # 候选标签文件名按常见模式依次尝试。
                 candidate_paths: List[Path] = []
                 if self.labels_dir is not None:
-                    # 当前数据集使用的 sample_XXXX_YY_label.(npy/npz)
+                    # 当前数据集使用的 sample_XXXX_YY_label.npy
                     candidate_paths.append(self.labels_dir / f"sample_{patch_token}_label.npy")
-                    candidate_paths.append(self.labels_dir / f"sample_{patch_token}_label.npz")
 
                     # MTS12 AEF 命名：eopath_<id>_<col>_<row>，标签按 ID 命名。
                     m_eopath = re.match(r"^eopath_(\d+)_\d+_\d+$", patch_token)
                     if m_eopath is not None:
                         patch_id = int(m_eopath.group(1))
-                        candidate_paths.append(self.labels_dir / f"ParcelIDs_{patch_id:05d}_labels.npz")
-                        candidate_paths.append(self.labels_dir / f"ParcelIDs_{patch_id}_labels.npz")
+                        candidate_paths.append(self.labels_dir / f"ParcelIDs_{patch_id:05d}_labels.npy")
+                        candidate_paths.append(self.labels_dir / f"ParcelIDs_{patch_id}_labels.npy")
                         candidate_paths.append(self.labels_dir / f"ParcelIDs_{patch_id:05d}.npy")
                         candidate_paths.append(self.labels_dir / f"ParcelIDs_{patch_id}.npy")
 
-                    # 向后兼容原始 ParcelIDs_XXXXX_labels.npz 方案（仅使用末尾数字串）。
+                    # 向后兼容原始 ParcelIDs_XXXXX_labels.npy / ParcelIDs_XXXXX.npy 方案（仅使用末尾数字串）。
                     m = re.search(r"(\d+)$", patch_token)
                     if m is not None:
                         patch_suffix = m.group(1)
-                        candidate_paths.append(self.labels_dir / f"ParcelIDs_{int(patch_suffix):05d}_labels.npz")
-                        candidate_paths.append(self.labels_dir / f"ParcelIDs_{patch_suffix}_labels.npz")
+                        candidate_paths.append(self.labels_dir / f"ParcelIDs_{int(patch_suffix):05d}_labels.npy")
+                        candidate_paths.append(self.labels_dir / f"ParcelIDs_{patch_suffix}_labels.npy")
                         candidate_paths.append(self.labels_dir / f"ParcelIDs_{int(patch_suffix):05d}.npy")
                         candidate_paths.append(self.labels_dir / f"ParcelIDs_{patch_suffix}.npy")
 
@@ -254,15 +349,7 @@ class EmbeddingSegmentationDataset(Dataset):
                     + ", ".join(str(c) for c in candidate_paths)
                 )
 
-            data = np.load(label_file, allow_pickle=True)
-            if isinstance(data, np.lib.npyio.NpzFile) and "labels" in data:
-                labels_np = data["labels"]
-            else:
-                labels_np = data
-            if labels_np.ndim != 2:
-                raise ValueError(
-                    f"Expected labels with shape (H,W) in {label_file}, got {labels_np.shape}"
-                )
+            labels_np = load_label_mask_from_file(label_file)
         else:
             labels_np = self.labels_np  # type: ignore[assignment]
 
@@ -294,6 +381,9 @@ class AugmentedTrainDataset(Dataset):
         foreground_crop_prob: float = 0.0,
         background_index: int = 0,
         ignore_index: int = 19,
+        sample_foreground_ratios: Optional[np.ndarray] = None,
+        fg_ratio_threshold: float = 0.2,
+        fg_aug_boost: float = 1.5,
     ):
         self.base_dataset = base_dataset
         self.repeat_factor = max(1, int(repeat_factor))
@@ -305,46 +395,84 @@ class AugmentedTrainDataset(Dataset):
         self.foreground_crop_prob = float(np.clip(foreground_crop_prob, 0.0, 1.0))
         self.background_index = int(background_index)
         self.ignore_index = int(ignore_index)
+        self.fg_ratio_threshold = float(np.clip(fg_ratio_threshold, 0.0, 1.0))
+        self.fg_aug_boost = max(1.0, float(fg_aug_boost))
+        self.sample_foreground_ratios = None
+        if sample_foreground_ratios is not None:
+            ratios = np.asarray(sample_foreground_ratios, dtype=np.float32).reshape(-1)
+            if len(ratios) != len(base_dataset):
+                raise ValueError(
+                    f"sample_foreground_ratios length {len(ratios)} does not match base dataset length {len(base_dataset)}"
+                )
+            self.sample_foreground_ratios = ratios
 
     def __len__(self) -> int:
         return len(self.base_dataset) * self.repeat_factor
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        x, y = self.base_dataset[idx % len(self.base_dataset)]
+        base_idx = idx % len(self.base_dataset)
+        x, y = self.base_dataset[base_idx]
+
+        fg_ratio = None
+        if self.sample_foreground_ratios is not None:
+            fg_ratio = float(self.sample_foreground_ratios[base_idx])
 
         # Clone to avoid in-place mutation of tensors returned by base dataset.
         x = x.clone()
         y = y.clone()
 
+        adaptive_flip_prob = self.flip_prob
+        adaptive_rot90_prob = self.rot90_prob
+        adaptive_noise_std = self.noise_std
+        adaptive_gain_std = self.gain_std
+        adaptive_crop_size = self.crop_size
+        adaptive_foreground_crop_prob = self.foreground_crop_prob
+
+        if fg_ratio is not None and fg_ratio >= self.fg_ratio_threshold:
+            span = max(1e-6, 1.0 - self.fg_ratio_threshold)
+            strength = float(np.clip((fg_ratio - self.fg_ratio_threshold) / span, 0.0, 1.0))
+            boost = 1.0 + (self.fg_aug_boost - 1.0) * strength
+            adaptive_flip_prob = float(np.clip(self.flip_prob * (0.8 + 0.2 * boost), 0.0, 1.0))
+            adaptive_rot90_prob = float(np.clip(self.rot90_prob * (0.8 + 0.2 * boost), 0.0, 1.0))
+            adaptive_noise_std = self.noise_std * boost
+            adaptive_gain_std = self.gain_std * boost
+            adaptive_foreground_crop_prob = float(np.clip(self.foreground_crop_prob * boost, 0.0, 1.0))
+            if self.crop_size > 0:
+                adaptive_crop_size = min(
+                    max(1, int(round(self.crop_size * (1.0 + 0.25 * strength)))),
+                    x.shape[-2],
+                    x.shape[-1],
+                )
+
         # Random flips (geometric transforms must be applied to both x and y).
-        if torch.rand(1).item() < self.flip_prob:
+        if torch.rand(1).item() < adaptive_flip_prob:
             x = torch.flip(x, dims=[2])
             y = torch.flip(y, dims=[1])
-        if torch.rand(1).item() < self.flip_prob:
+        if torch.rand(1).item() < adaptive_flip_prob:
             x = torch.flip(x, dims=[1])
             y = torch.flip(y, dims=[0])
 
         # Random 90-degree rotation avoids interpolation artifacts for labels.
-        if torch.rand(1).item() < self.rot90_prob:
+        if torch.rand(1).item() < adaptive_rot90_prob:
             k = int(torch.randint(0, 4, (1,)).item())
             if k > 0:
                 x = torch.rot90(x, k=k, dims=[1, 2])
                 y = torch.rot90(y, k=k, dims=[0, 1])
 
         # Intensity jitter for embeddings (labels unchanged).
-        if self.gain_std > 0:
-            gain = 1.0 + torch.randn(1, dtype=x.dtype).item() * self.gain_std
+        if adaptive_gain_std > 0:
+            gain = 1.0 + torch.randn(1, dtype=x.dtype).item() * adaptive_gain_std
             x = x * gain
-        if self.noise_std > 0:
-            x = x + torch.randn_like(x) * self.noise_std
+        if adaptive_noise_std > 0:
+            x = x + torch.randn_like(x) * adaptive_noise_std
 
         # Foreground-aware random crop increases effective fg pixel ratio.
-        if self.crop_size > 0:
+        if adaptive_crop_size > 0:
             _, h, w = x.shape
-            cs = min(self.crop_size, h, w)
+            cs = min(adaptive_crop_size, h, w)
             if cs < h or cs < w:
                 top, left = 0, 0
-                use_fg_center = torch.rand(1).item() < self.foreground_crop_prob
+                use_fg_center = torch.rand(1).item() < adaptive_foreground_crop_prob
                 if use_fg_center:
                     fg_mask = (y != self.background_index) & (y != self.ignore_index)
                     fg_idx = torch.nonzero(fg_mask, as_tuple=False)
@@ -402,7 +530,7 @@ def estimate_feature_channel_stats(dataset: Dataset, max_samples: int = 0) -> tu
         x, _ = dataset[i]  # (C,H,W)
         x = x.float()
         c = x.shape[0]
-        flat = x.view(c, -1)
+        flat = x.reshape(c, -1)
         s = flat.sum(dim=1)
         ss = (flat * flat).sum(dim=1)
         if sum_c is None:
@@ -460,7 +588,7 @@ def estimate_label_valid_ratio(
 
     for i in range(n):
         _x, y = dataset[i]
-        y = y.view(-1).to(torch.int64)
+        y = y.reshape(-1).to(torch.int64)
 
         ymin = int(y.min().item())
         ymax = int(y.max().item())
@@ -476,11 +604,14 @@ def estimate_label_valid_ratio(
 
 
 class DoubleConv(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int, norm: str = "group"):
+    def __init__(self, in_ch: int, out_ch: int, norm: str = "instance"):
         super().__init__()
         if norm == "batch":
             norm1 = nn.BatchNorm2d(out_ch)
             norm2 = nn.BatchNorm2d(out_ch)
+        elif norm == "instance":
+            norm1 = nn.InstanceNorm2d(out_ch, affine=True)
+            norm2 = nn.InstanceNorm2d(out_ch, affine=True)
         else:
             # GroupNorm is more stable than BatchNorm for small/imbalanced batches.
             g = 8 if out_ch % 8 == 0 else 4 if out_ch % 4 == 0 else 1
@@ -502,6 +633,8 @@ class DoubleConv(nn.Module):
 def _make_norm(norm: str, channels: int) -> nn.Module:
     if norm == "batch":
         return nn.BatchNorm2d(channels)
+    if norm == "instance":
+        return nn.InstanceNorm2d(channels, affine=True)
     g = 8 if channels % 8 == 0 else 4 if channels % 4 == 0 else 1
     return nn.GroupNorm(g, channels)
 
@@ -576,7 +709,9 @@ class AttentionGate(nn.Module):
 
 
 class UNet(nn.Module):
-    def __init__(self, in_channels: int, num_classes: int = 20, base_ch: int = 32, norm: str = "group"):
+    """2-D U-Net with a VGG16-style encoder and InstanceNorm blocks."""
+
+    def __init__(self, in_channels: int, num_classes: int = 20, base_ch: int = 32, norm: str = "instance"):
         super().__init__()
         self.enc1 = DoubleConv(in_channels, base_ch, norm=norm)
         self.pool1 = nn.MaxPool2d(2)
@@ -590,19 +725,31 @@ class UNet(nn.Module):
         self.bottleneck = DoubleConv(base_ch * 8, base_ch * 16, norm=norm)
 
         self.up4 = nn.ConvTranspose2d(base_ch * 16, base_ch * 8, kernel_size=2, stride=2)
-        self.ag4 = AttentionGate(skip_ch=base_ch * 8, gate_ch=base_ch * 8, inter_ch=max(base_ch * 4, 8))
         self.dec4 = DoubleConv(base_ch * 16, base_ch * 8, norm=norm)
         self.up3 = nn.ConvTranspose2d(base_ch * 8, base_ch * 4, kernel_size=2, stride=2)
-        self.ag3 = AttentionGate(skip_ch=base_ch * 4, gate_ch=base_ch * 4, inter_ch=max(base_ch * 2, 8))
         self.dec3 = DoubleConv(base_ch * 8, base_ch * 4, norm=norm)
         self.up2 = nn.ConvTranspose2d(base_ch * 4, base_ch * 2, kernel_size=2, stride=2)
-        self.ag2 = AttentionGate(skip_ch=base_ch * 2, gate_ch=base_ch * 2, inter_ch=max(base_ch, 8))
         self.dec2 = DoubleConv(base_ch * 4, base_ch * 2, norm=norm)
         self.up1 = nn.ConvTranspose2d(base_ch * 2, base_ch, kernel_size=2, stride=2)
-        self.ag1 = AttentionGate(skip_ch=base_ch, gate_ch=base_ch, inter_ch=max(base_ch // 2, 8))
         self.dec1 = DoubleConv(base_ch * 2, base_ch, norm=norm)
 
         self.out_conv = nn.Conv2d(base_ch, num_classes, kernel_size=1)
+
+    @staticmethod
+    def _match_spatial(skip: torch.Tensor, gate: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if skip.shape[-2:] == gate.shape[-2:]:
+            return skip, gate
+
+        h = min(skip.shape[-2], gate.shape[-2])
+        w = min(skip.shape[-1], gate.shape[-1])
+
+        def center_crop(t: torch.Tensor, target_h: int, target_w: int) -> torch.Tensor:
+            _, _, th, tw = t.shape
+            start_h = max((th - target_h) // 2, 0)
+            start_w = max((tw - target_w) // 2, 0)
+            return t[:, :, start_h : start_h + target_h, start_w : start_w + target_w]
+
+        return center_crop(skip, h, w), center_crop(gate, h, w)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Encoder
@@ -614,23 +761,23 @@ class UNet(nn.Module):
 
         # Decoder with skip connections
         x = self.up4(xb)
-        x4_gated = self.ag4(x4, x)
-        x = torch.cat([x4_gated, x], dim=1)
+        x4, x = self._match_spatial(x4, x)
+        x = torch.cat([x4, x], dim=1)
         x = self.dec4(x)
 
         x = self.up3(x)
-        x3_gated = self.ag3(x3, x)
-        x = torch.cat([x3_gated, x], dim=1)
+        x3, x = self._match_spatial(x3, x)
+        x = torch.cat([x3, x], dim=1)
         x = self.dec3(x)
 
         x = self.up2(x)
-        x2_gated = self.ag2(x2, x)
-        x = torch.cat([x2_gated, x], dim=1)
+        x2, x = self._match_spatial(x2, x)
+        x = torch.cat([x2, x], dim=1)
         x = self.dec2(x)
 
         x = self.up1(x)
-        x1_gated = self.ag1(x1, x)
-        x = torch.cat([x1_gated, x], dim=1)
+        x1, x = self._match_spatial(x1, x)
+        x = torch.cat([x1, x], dim=1)
         x = self.dec1(x)
 
         return self.out_conv(x)
@@ -643,7 +790,7 @@ class UNetDeep(nn.Module):
       base, 2*base, 4*base, 8*base, 16*base, bottleneck=32*base
     """
 
-    def __init__(self, in_channels: int, num_classes: int = 20, base_ch: int = 32, norm: str = "group"):
+    def __init__(self, in_channels: int, num_classes: int = 20, base_ch: int = 32, norm: str = "instance"):
         super().__init__()
         self.enc1 = DoubleConv(in_channels, base_ch, norm=norm)
         self.pool1 = nn.MaxPool2d(2)
@@ -659,22 +806,33 @@ class UNetDeep(nn.Module):
         self.bottleneck = DoubleConv(base_ch * 16, base_ch * 32, norm=norm)
 
         self.up5 = nn.ConvTranspose2d(base_ch * 32, base_ch * 16, kernel_size=2, stride=2)
-        self.ag5 = AttentionGate(skip_ch=base_ch * 16, gate_ch=base_ch * 16, inter_ch=max(base_ch * 8, 8))
         self.dec5 = DoubleConv(base_ch * 32, base_ch * 16, norm=norm)
         self.up4 = nn.ConvTranspose2d(base_ch * 16, base_ch * 8, kernel_size=2, stride=2)
-        self.ag4 = AttentionGate(skip_ch=base_ch * 8, gate_ch=base_ch * 8, inter_ch=max(base_ch * 4, 8))
         self.dec4 = DoubleConv(base_ch * 16, base_ch * 8, norm=norm)
         self.up3 = nn.ConvTranspose2d(base_ch * 8, base_ch * 4, kernel_size=2, stride=2)
-        self.ag3 = AttentionGate(skip_ch=base_ch * 4, gate_ch=base_ch * 4, inter_ch=max(base_ch * 2, 8))
         self.dec3 = DoubleConv(base_ch * 8, base_ch * 4, norm=norm)
         self.up2 = nn.ConvTranspose2d(base_ch * 4, base_ch * 2, kernel_size=2, stride=2)
-        self.ag2 = AttentionGate(skip_ch=base_ch * 2, gate_ch=base_ch * 2, inter_ch=max(base_ch, 8))
         self.dec2 = DoubleConv(base_ch * 4, base_ch * 2, norm=norm)
         self.up1 = nn.ConvTranspose2d(base_ch * 2, base_ch, kernel_size=2, stride=2)
-        self.ag1 = AttentionGate(skip_ch=base_ch, gate_ch=base_ch, inter_ch=max(base_ch // 2, 8))
         self.dec1 = DoubleConv(base_ch * 2, base_ch, norm=norm)
 
         self.out_conv = nn.Conv2d(base_ch, num_classes, kernel_size=1)
+
+    @staticmethod
+    def _match_spatial(skip: torch.Tensor, gate: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if skip.shape[-2:] == gate.shape[-2:]:
+            return skip, gate
+
+        h = min(skip.shape[-2], gate.shape[-2])
+        w = min(skip.shape[-1], gate.shape[-1])
+
+        def center_crop(t: torch.Tensor, target_h: int, target_w: int) -> torch.Tensor:
+            _, _, th, tw = t.shape
+            start_h = max((th - target_h) // 2, 0)
+            start_w = max((tw - target_w) // 2, 0)
+            return t[:, :, start_h : start_h + target_h, start_w : start_w + target_w]
+
+        return center_crop(skip, h, w), center_crop(gate, h, w)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x1 = self.enc1(x)
@@ -685,28 +843,28 @@ class UNetDeep(nn.Module):
         xb = self.bottleneck(self.pool5(x5))
 
         x = self.up5(xb)
-        x5_gated = self.ag5(x5, x)
-        x = torch.cat([x5_gated, x], dim=1)
+        x5, x = self._match_spatial(x5, x)
+        x = torch.cat([x5, x], dim=1)
         x = self.dec5(x)
 
         x = self.up4(x)
-        x4_gated = self.ag4(x4, x)
-        x = torch.cat([x4_gated, x], dim=1)
+        x4, x = self._match_spatial(x4, x)
+        x = torch.cat([x4, x], dim=1)
         x = self.dec4(x)
 
         x = self.up3(x)
-        x3_gated = self.ag3(x3, x)
-        x = torch.cat([x3_gated, x], dim=1)
+        x3, x = self._match_spatial(x3, x)
+        x = torch.cat([x3, x], dim=1)
         x = self.dec3(x)
 
         x = self.up2(x)
-        x2_gated = self.ag2(x2, x)
-        x = torch.cat([x2_gated, x], dim=1)
+        x2, x = self._match_spatial(x2, x)
+        x = torch.cat([x2, x], dim=1)
         x = self.dec2(x)
 
         x = self.up1(x)
-        x1_gated = self.ag1(x1, x)
-        x = torch.cat([x1_gated, x], dim=1)
+        x1, x = self._match_spatial(x1, x)
+        x = torch.cat([x1, x], dim=1)
         x = self.dec1(x)
 
         return self.out_conv(x)
@@ -769,6 +927,93 @@ class UNetResSE(nn.Module):
         for up, attn, dec, skip in zip(self.upconvs, self.attn_gates, self.dec_blocks, reversed(skips)):
             x = up(x)
             skip = attn(skip, x)
+            x = torch.cat([skip, x], dim=1)
+            x = dec(x)
+
+        return self.out_conv(x)
+
+
+class SeparableConvBlock(nn.Module):
+    """Depthwise-separable conv block for lightweight segmentation backbones."""
+
+    def __init__(self, in_ch: int, out_ch: int, norm: str = "group"):
+        super().__init__()
+        self.depthwise = nn.Conv2d(in_ch, in_ch, kernel_size=3, padding=1, groups=in_ch, bias=False)
+        self.pointwise = nn.Conv2d(in_ch, out_ch, kernel_size=1, bias=False)
+        self.norm = _make_norm(norm, out_ch)
+        self.act = nn.ReLU(inplace=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.depthwise(x)
+        x = self.pointwise(x)
+        x = self.norm(x)
+        return self.act(x)
+
+
+class LightweightConv(nn.Module):
+    def __init__(self, in_ch: int, out_ch: int, norm: str = "group"):
+        super().__init__()
+        self.block = nn.Sequential(
+            SeparableConvBlock(in_ch, out_ch, norm=norm),
+            SeparableConvBlock(out_ch, out_ch, norm=norm),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.block(x)
+
+
+class UNetLightweight(nn.Module):
+    """Lightweight UNet using depthwise-separable blocks and bilinear upsampling."""
+
+    def __init__(
+        self,
+        in_channels: int,
+        num_classes: int = 20,
+        base_ch: int = 24,
+        norm: str = "group",
+        depth: int = 4,
+    ):
+        super().__init__()
+        if depth not in (4, 5):
+            raise ValueError(f"UNetLightweight supports depth 4 or 5, got {depth}")
+
+        enc_channels = [base_ch, base_ch * 2, base_ch * 4, base_ch * 8]
+        if depth == 5:
+            enc_channels.append(base_ch * 16)
+
+        self.enc_blocks = nn.ModuleList()
+        self.pools = nn.ModuleList()
+        in_ch = in_channels
+        for c in enc_channels:
+            self.enc_blocks.append(LightweightConv(in_ch, c, norm=norm))
+            self.pools.append(nn.MaxPool2d(2))
+            in_ch = c
+
+        bottleneck_ch = enc_channels[-1] * 2
+        self.bottleneck = LightweightConv(enc_channels[-1], bottleneck_ch, norm=norm)
+
+        self.up_projs = nn.ModuleList()
+        self.dec_blocks = nn.ModuleList()
+        cur_ch = bottleneck_ch
+        for skip_ch in reversed(enc_channels):
+            self.up_projs.append(nn.Conv2d(cur_ch, skip_ch, kernel_size=1, bias=False))
+            self.dec_blocks.append(LightweightConv(skip_ch * 2, skip_ch, norm=norm))
+            cur_ch = skip_ch
+
+        self.out_conv = nn.Conv2d(cur_ch, num_classes, kernel_size=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        skips = []
+        for block, pool in zip(self.enc_blocks, self.pools):
+            x = block(x)
+            skips.append(x)
+            x = pool(x)
+
+        x = self.bottleneck(x)
+
+        for proj, dec, skip in zip(self.up_projs, self.dec_blocks, reversed(skips)):
+            x = nn.functional.interpolate(x, size=skip.shape[-2:], mode="bilinear", align_corners=False)
+            x = proj(x)
             x = torch.cat([skip, x], dim=1)
             x = dec(x)
 
@@ -1150,7 +1395,7 @@ def estimate_class_weights(
     loader = DataLoader(dataset, batch_size=1, shuffle=False)
 
     for _x, y in loader:
-        y_flat = y.view(-1)
+        y_flat = y.reshape(-1)
         # 仅统计合法类别 [0, num_classes-1]，并排除 ignore_index；
         # 对于 255 等越界值，自动视为 ignore，避免 bincount 长度>num_classes。
         valid = (y_flat != ignore_index) & (y_flat >= 0) & (y_flat < num_classes)
@@ -1208,6 +1453,141 @@ def compute_segmentation_metrics(
     return pixel_acc, miou
 
 
+def compute_confusion_matrix(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    num_classes: int,
+    ignore_index: int,
+) -> np.ndarray:
+    """Compute a raw confusion matrix over valid pixels."""
+    logits, target = align_logits_and_target_spatial(logits, target)
+    preds = logits.argmax(dim=1)
+
+    mask = target != ignore_index
+    if int(mask.sum().item()) == 0:
+        return np.zeros((num_classes, num_classes), dtype=np.int64)
+
+    y_true = target[mask].reshape(-1).to(torch.int64)
+    y_pred = preds[mask].reshape(-1).to(torch.int64)
+    valid = (y_true >= 0) & (y_true < num_classes) & (y_pred >= 0) & (y_pred < num_classes)
+    if int(valid.sum().item()) == 0:
+        return np.zeros((num_classes, num_classes), dtype=np.int64)
+
+    idx = y_true[valid] * num_classes + y_pred[valid]
+    binc = torch.bincount(idx, minlength=num_classes * num_classes)
+    return binc.reshape(num_classes, num_classes).cpu().numpy().astype(np.int64)
+
+
+def compute_f1_from_confusion_matrix(
+    confusion_matrix: np.ndarray,
+    background_index: int = 0,
+    ignore_background: bool = True,
+    class_indices: Optional[List[int]] = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, float, float, float, float]:
+    """Return per-class precision/recall/F1 and macro/weighted averages.
+
+    The confusion matrix is expected to be shaped (num_classes, num_classes)
+    with rows = ground truth and columns = predictions.
+    """
+    cm = np.asarray(confusion_matrix, dtype=np.float64)
+    if cm.ndim != 2 or cm.shape[0] != cm.shape[1]:
+        raise ValueError(f"Expected square confusion matrix, got shape {cm.shape}")
+
+    tp = np.diag(cm)
+    fp = cm.sum(axis=0) - tp
+    fn = cm.sum(axis=1) - tp
+
+    precision = np.divide(tp, tp + fp, out=np.zeros_like(tp), where=(tp + fp) > 0)
+    recall = np.divide(tp, tp + fn, out=np.zeros_like(tp), where=(tp + fn) > 0)
+    f1 = np.divide(2.0 * precision * recall, precision + recall, out=np.zeros_like(tp), where=(precision + recall) > 0)
+
+    if class_indices is None:
+        valid_classes = [cls for cls in range(cm.shape[0]) if not (ignore_background and cls == background_index)]
+    else:
+        valid_classes = []
+        for cls in class_indices:
+            if not (0 <= cls < cm.shape[0]):
+                continue
+            if ignore_background and cls == background_index:
+                continue
+            valid_classes.append(cls)
+    if valid_classes:
+        macro_precision = float(np.mean(precision[valid_classes]))
+        macro_recall = float(np.mean(recall[valid_classes]))
+        macro_f1 = float(np.mean(f1[valid_classes]))
+        class_support = cm.sum(axis=1)
+        support = class_support[valid_classes]
+        support_sum = float(np.sum(support))
+        if support_sum > 0.0:
+            weighted_f1 = float(np.sum(f1[valid_classes] * support) / support_sum)
+        else:
+            weighted_f1 = 0.0
+    else:
+        macro_precision = 0.0
+        macro_recall = 0.0
+        macro_f1 = 0.0
+        weighted_f1 = 0.0
+
+    return precision, recall, f1, macro_precision, macro_recall, macro_f1, weighted_f1
+
+
+def save_confusion_matrix_visualization(
+    confusion_matrix: np.ndarray,
+    output_dir: Path,
+    prefix: str = "val",
+    class_names: Optional[List[str]] = None,
+    normalize: bool = True,
+) -> None:
+    """Save confusion matrix as NPY and PNG visualizations."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    cm = np.asarray(confusion_matrix, dtype=np.float64)
+    if cm.ndim != 2 or cm.shape[0] != cm.shape[1]:
+        raise ValueError(f"Expected square confusion matrix, got shape {cm.shape}")
+
+    np.save(output_dir / f"{prefix}_confusion_matrix.npy", cm.astype(np.int64))
+
+    row_sums = cm.sum(axis=1, keepdims=True)
+    cm_norm = np.divide(cm, row_sums, out=np.zeros_like(cm), where=row_sums > 0)
+    np.save(output_dir / f"{prefix}_confusion_matrix_norm.npy", cm_norm.astype(np.float32))
+
+    plot_cm = cm_norm if normalize else cm
+    fig_size = max(8.0, 0.35 * cm.shape[0] + 4.0)
+    fig, ax = plt.subplots(figsize=(fig_size, fig_size))
+    im = ax.imshow(plot_cm, cmap="Blues", interpolation="nearest", vmin=0.0 if normalize else None)
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+    if class_names is None:
+        class_names = [str(i) for i in range(cm.shape[0])]
+    ax.set_xticks(np.arange(cm.shape[1]))
+    ax.set_yticks(np.arange(cm.shape[0]))
+    ax.set_xticklabels(class_names, rotation=45, ha="right")
+    ax.set_yticklabels(class_names)
+    ax.set_xlabel("Predicted label")
+    ax.set_ylabel("True label")
+    ax.set_title("Validation confusion matrix" + (" (row-normalized)" if normalize else ""))
+
+    if cm.shape[0] <= 20:
+        thresh = float(np.nanmax(plot_cm)) * 0.6 if plot_cm.size > 0 else 0.0
+        for i in range(cm.shape[0]):
+            for j in range(cm.shape[1]):
+                value = plot_cm[i, j]
+                text = f"{value:.2f}" if normalize else f"{int(cm[i, j])}"
+                ax.text(
+                    j,
+                    i,
+                    text,
+                    ha="center",
+                    va="center",
+                    color="white" if value > thresh else "black",
+                    fontsize=7,
+                )
+
+    fig.tight_layout()
+    fig.savefig(output_dir / f"{prefix}_confusion_matrix.png", dpi=180, bbox_inches="tight")
+    plt.close(fig)
+
+
 def evaluate_per_class_iou(
     model: nn.Module,
     data_loader: DataLoader,
@@ -1221,7 +1601,9 @@ def evaluate_per_class_iou(
 
     Returns a numpy array of length ``num_classes`` where entries for
     ignored classes (``ignore_index`` and optionally ``background_index``)
-    are set to NaN.
+    are set to NaN. Classes that are not ignored but have zero pixels will
+    return 0.0 (rather than NaN) so they are included in downstream
+    averages such as mF1/weighted-F1.
     """
 
     inter = np.zeros(num_classes, dtype=np.float64)
@@ -1249,12 +1631,92 @@ def evaluate_per_class_iou(
                 inter[cls] += (p & t).sum().item()
                 union[cls] += (p | t).sum().item()
 
-    per_class_iou = np.full(num_classes, np.nan, dtype=np.float32)
+    per_class_iou = np.full(num_classes, 0.0, dtype=np.float32)
     for cls in range(num_classes):
-        if union[cls] > 0.0 and not np.isnan(union[cls]):
+        if cls == ignore_index:
+            per_class_iou[cls] = np.nan
+            continue
+        if ignore_background and cls == background_index:
+            per_class_iou[cls] = np.nan
+            continue
+
+        if union[cls] > 0.0:
             per_class_iou[cls] = float(inter[cls] / union[cls])
+        else:
+            # No pixels for this class in GT+pred: report IoU=0.0 (include in averages)
+            per_class_iou[cls] = 0.0
 
     return per_class_iou
+
+
+def dump_per_class_iou_report(
+    per_class_iou: np.ndarray,
+    output_dir: Path,
+    prefix: str = "best_val",
+    per_class_f1: Optional[np.ndarray] = None,
+    weighted_f1: Optional[float] = None,
+) -> List[dict]:
+    """Print and save per-class IoU report as NPY/JSON/CSV.
+
+    Returns a list of dict rows: {class_index, iou, f1?, weighted_f1?}.
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    npy_path = output_dir / f"{prefix}_per_class_iou.npy"
+    json_path = output_dir / f"{prefix}_per_class_iou.json"
+    csv_path = output_dir / f"{prefix}_per_class_iou.csv"
+
+    np.save(npy_path, per_class_iou)
+
+    rows: List[dict] = []
+    print("Per-class IoU report (NaN = ignored classes; IoU=0.0 indicates no pixels):")
+    for cls_idx, iou in enumerate(per_class_iou):
+        iou_value = None if np.isnan(iou) else float(iou)
+        row = {"class_index": int(cls_idx), "iou": iou_value}
+        if per_class_f1 is not None and cls_idx < len(per_class_f1):
+            f1_value = None if np.isnan(per_class_f1[cls_idx]) else float(per_class_f1[cls_idx])
+            row["f1"] = f1_value
+        if weighted_f1 is not None:
+            row["weighted_f1"] = None if np.isnan(weighted_f1) else float(weighted_f1)
+        rows.append(row)
+        if iou_value is None:
+            if "f1" in row:
+                f1_text = "NaN" if row["f1"] is None else f"{row['f1']:.4f}"
+                wf1_text = "NaN" if row.get("weighted_f1") is None else f"{row['weighted_f1']:.4f}"
+                print(f"  class {cls_idx}: IoU=NaN, F1={f1_text}, weighted_F1={wf1_text}")
+            else:
+                print(f"  class {cls_idx}: NaN")
+        else:
+            if "f1" in row:
+                f1_text = "NaN" if row["f1"] is None else f"{row['f1']:.4f}"
+                wf1_text = "NaN" if row.get("weighted_f1") is None else f"{row['weighted_f1']:.4f}"
+                print(f"  class {cls_idx}: IoU={iou_value:.4f}, F1={f1_text}, weighted_F1={wf1_text}")
+            else:
+                print(f"  class {cls_idx}: {iou_value:.4f}")
+
+    with json_path.open("w", encoding="utf-8") as f:
+        json.dump(rows, f, ensure_ascii=False, indent=2)
+
+    with csv_path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        header = ["class_index", "iou"]
+        if per_class_f1 is not None:
+            header.append("f1")
+        if weighted_f1 is not None:
+            header.append("weighted_f1")
+        writer.writerow(header)
+        for row in rows:
+            csv_row = [row["class_index"], "" if row["iou"] is None else f"{row['iou']:.6f}"]
+            if per_class_f1 is not None:
+                csv_row.append("" if row.get("f1") is None else f"{row['f1']:.6f}")
+            if weighted_f1 is not None:
+                csv_row.append("" if row.get("weighted_f1") is None else f"{row['weighted_f1']:.6f}")
+            writer.writerow(csv_row)
+
+    print(f"Saved per-class IoU report to {npy_path}")
+    print(f"Saved per-class IoU report to {json_path}")
+    print(f"Saved per-class IoU report to {csv_path}")
+    return rows
 
 
 def labels_to_rgb(mask, num_classes, ignore_index):
@@ -1405,7 +1867,7 @@ def train(args: argparse.Namespace):
         max_samples=16,
     )
     if valid_ratio < 0.95:
-        sample_unique = torch.unique(sample_labels.view(-1)).cpu().numpy().tolist()
+        sample_unique = torch.unique(sample_labels.reshape(-1)).cpu().numpy().tolist()
         sample_unique_preview = sample_unique[:12]
         raise ValueError(
             "Label sanity check failed: most label pixels are outside valid class range. "
@@ -1489,6 +1951,11 @@ def train(args: argparse.Namespace):
     val_ds = base_val_ds
 
     if args.enable_augmentation == 1 and len(base_train_ds) > 0:
+        train_fg_ratios = estimate_sample_foreground_ratios(
+            raw_base_train_ds,
+            background_index=args.background_index,
+            ignore_index=args.ignore_index,
+        )
         train_ds = AugmentedTrainDataset(
             base_dataset=base_train_ds,
             repeat_factor=args.train_repeat_factor,
@@ -1500,6 +1967,9 @@ def train(args: argparse.Namespace):
             foreground_crop_prob=args.fg_crop_prob,
             background_index=args.background_index,
             ignore_index=args.ignore_index,
+            sample_foreground_ratios=train_fg_ratios,
+            fg_ratio_threshold=args.fg_aug_ratio_threshold,
+            fg_aug_boost=args.fg_aug_boost,
         )
 
     print(f"Train samples: {len(train_ds)}, Val samples: {len(val_ds) if val_ds is not None else 0}")
@@ -1509,7 +1979,8 @@ def train(args: argparse.Namespace):
             f"(repeat={args.train_repeat_factor}, flip_prob={args.aug_flip_prob}, "
             f"rot90_prob={args.aug_rot90_prob}, noise_std={args.aug_noise_std}, "
             f"gain_std={args.aug_gain_std}, crop_size={args.train_crop_size}, "
-            f"fg_crop_prob={args.fg_crop_prob})"
+            f"fg_crop_prob={args.fg_crop_prob}, fg_ratio_threshold={args.fg_aug_ratio_threshold}, "
+            f"fg_aug_boost={args.fg_aug_boost})"
         )
     else:
         print("Train augmentation: OFF")
@@ -1602,6 +2073,17 @@ def train(args: argparse.Namespace):
             f"Model: UNetResSE(depth={args.unet_depth}, base_channels={args.base_channels}, "
             f"dropout={args.dropout_rate})"
         )
+    elif args.model_variant == "lightweight":
+        model = UNetLightweight(
+            in_channels=C,
+            num_classes=args.num_classes,
+            base_ch=args.base_channels,
+            norm=args.norm_type,
+            depth=args.unet_depth,
+        )
+        print(
+            f"Model: UNetLightweight(depth={args.unet_depth}, base_channels={args.base_channels})"
+        )
     elif args.model_variant == "aspp":
         model = DeepLabLite(
             in_channels=C,
@@ -1658,14 +2140,17 @@ def train(args: argparse.Namespace):
             focal_class_weights = None
 
     # Focal 采样类别：默认使用全部前景类（排除 background 与 ignore）。
+    # 注意：'all' 应包含 background，'all_fg' 才排除 background。
     focus_classes: List[int]
     focus_spec = str(getattr(args, "focal_focus_classes", "all_fg")).strip().lower()
-    if focus_spec in ("", "all", "all_fg"):
+    if focus_spec in ("", "all_fg"):
         focus_classes = [
             c
             for c in range(args.num_classes)
             if c not in (args.background_index, args.ignore_index)
         ]
+    elif focus_spec == "all":
+        focus_classes = [c for c in range(args.num_classes) if c != args.ignore_index]
     else:
         parsed: List[int] = []
         for tok in str(args.focal_focus_classes).split(","):
@@ -1971,13 +2456,7 @@ def train(args: argparse.Namespace):
                 ignore_background=args.ignore_background_in_metrics,
             )
 
-            # 打印每个类别在 best checkpoint 下的 IoU。
-            print("Per-class IoU on best checkpoint (NaN = ignored / no pixels):")
-            for cls_idx, iou in enumerate(per_class_iou):
-                print(f"  class {cls_idx}: {iou:.4f}" if not np.isnan(iou) else f"  class {cls_idx}: NaN")
-
-            # 同时保存到输出目录，方便后续分析。
-            np.save(out_dir / "best_val_per_class_iou.npy", per_class_iou)
+            dump_per_class_iou_report(per_class_iou, output_dir=out_dir, prefix="best_val")
 
     save_val_visualizations(
         model=model,
@@ -2015,15 +2494,14 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         required=True,
         help=(
             "Path to embeddings. If a file, uses a single sample. If a "
-            "directory, uses all *.npz files inside as separate samples "
-            "(e.g., embedding_timeseries_*.npz)."
+            "directory, uses all *.npy files inside as separate samples."
         ),
     )
     p.add_argument(
         "--embedding_key",
         type=str,
-        default="embeddings_native",
-        help="Embedding key in npz to use (auto/embeddings/embeddings_native/embeddings_per_time)",
+        default="auto",
+        help="Embedding key in .npy object array to use (auto/embeddings/embeddings_native/embeddings_per_time)",
     )
     p.add_argument(
         "--resample_size",
@@ -2036,11 +2514,10 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         type=str,
         required=True,
         help=(
-            "Labels file (.npz with 'labels' key, or .npy integer mask). "
+            "Labels file (.npy integer mask). "
             "If this is a directory, per-patch matching is enabled automatically; "
             "you can also force it with --per_patch_labels. In that case it should "
-            "be a directory "
-            "containing per-patch files named ParcelIDs_XXXXX_labels.npz."
+            "be a directory containing per-patch files named ParcelIDs_XXXXX.npy."
         ),
     )
     p.add_argument(
@@ -2117,8 +2594,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--model_variant",
         type=str,
         default="basic",
-        choices=["basic", "resse", "aspp"],
-        help="Segmentation model variant: basic UNet, resse UNet, or aspp DeepLabLite",
+        choices=["basic", "resse", "lightweight", "aspp"],
+        help="Segmentation model variant: basic VGG16-style UNet, resse UNet, lightweight UNet, or aspp DeepLabLite",
     )
     p.add_argument(
         "--dropout_rate",
@@ -2129,9 +2606,9 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument(
         "--norm_type",
         type=str,
-        default="group",
-        choices=["group", "batch"],
-        help="Normalization layer type in UNet blocks: group or batch (default group)",
+        default="instance",
+        choices=["instance", "group", "batch"],
+        help="Normalization layer type in UNet blocks: instance, group, or batch (default instance)",
     )
     p.add_argument(
         "--val_fraction",
@@ -2148,8 +2625,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         action="store_true",
         help=(
             "If set, treat --labels_file as a directory with per-patch label "
-            "files named ParcelIDs_XXXXX_labels.npz that correspond 1:1 to "
-            "embedding_XXXXX*.npz files in --embeddings_path."
+            "files named ParcelIDs_XXXXX.npy that correspond 1:1 to "
+            "embedding_XXXXX*.npy files in --embeddings_path."
         ),
     )
     p.add_argument(
@@ -2238,6 +2715,24 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         type=float,
         default=0.8,
         help="Probability to center random crop on a foreground pixel (default 0.8)",
+    )
+    p.add_argument(
+        "--fg_aug_ratio_threshold",
+        type=float,
+        default=0.2,
+        help=(
+            "Foreground-ratio threshold above which a sample receives stronger augmentation "
+            "(default 0.2)."
+        ),
+    )
+    p.add_argument(
+        "--fg_aug_boost",
+        type=float,
+        default=1.5,
+        help=(
+            "Maximum augmentation boost applied to samples whose foreground ratio is above "
+            "--fg_aug_ratio_threshold (default 1.5)."
+        ),
     )
     p.add_argument(
         "--warmup_epochs",

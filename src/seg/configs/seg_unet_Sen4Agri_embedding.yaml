@@ -1,0 +1,102 @@
+input:
+  mode: raw   # embedding | raw
+
+labels:
+  num_classes: 12
+  ignore_index: 255
+  background_index: 0
+  ignore_background_in_metrics: true
+  ignore_background_in_dice: true
+
+model:
+  variant: basic    # basic | resse | lightweight | aspp
+  depth: 4
+  base_channels: 16
+  norm: group
+  dropout: 0.1
+
+train:
+  epochs: 70
+  batch_size: 4
+  num_workers: 4
+  persistent_workers: true
+  prefetch_factor: 4
+  val_interval: 2
+  lr: 3e-4
+  weight_decay: 1e-4
+  seed: 42
+  val_fraction: 0.2
+  early_stop_patience: 0
+  scheduler_monitor: val_miou
+  lr_patience: 5
+  lr_decay_factor: 0.5
+  min_lr: 1e-6
+  validate_first_epoch: false
+
+  dice_weight: 0.4
+  ce_weight: 0.0
+  focal_gamma: 2.0
+  focal_class_weights: "0,1,1,1,1,1,1,1,1,1,1,1"
+  focal_focus_classes: all_fg
+
+  save_val_samples: 0
+
+data:
+  resample_size: 0
+  normalize_features: false
+  feature_stats_max_samples: 0
+
+  enable_augmentation: true
+  train_repeat_factor: 1
+  aug_flip_prob: 0.5
+  aug_rot90_prob: 0.5
+  aug_noise_std: 0.01
+  aug_gain_std: 0.05
+  train_crop_size: 256
+  fg_crop_prob: 0.8
+  fg_aug_boost: 2.0
+
+  use_fg_sampler: false
+  fg_sampler_power: 1.5
+  fg_sampler_min_weight: 0.2
+
+runtime:
+  device: cuda:1
+  output_dir: /mnt/data/mhy/RSFM/AEF-seg-learning/data/Sen4Agri_31TCG/result/outputs_raw_basic
+  resume: false
+  resume_checkpoint: ""
+  resume_strict: true
+  amp: true
+  cudnn_benchmark: true
+  allow_tf32: true
+  channels_last: true
+  pin_memory: true
+  matmul_precision: high
+
+# embedding 模式数据路径
+embedding:
+  embedding_key: embeddings
+  per_patch_labels: false
+  train_embeddings_path: /mnt/data/mhy/RSFM/AEF-seg-learning/data/Sen4Agri_31TCG/embedding/AEF/train
+  train_labels_path: /mnt/data/mhy/RSFM/AEF-seg-learning/data/Sen4Agri_31TCG/label/train
+  val_embeddings_path: /mnt/data/mhy/RSFM/AEF-seg-learning/data/Sen4Agri_31TCG/embedding/AEF/val
+  val_labels_path: /mnt/data/mhy/RSFM/AEF-seg-learning/data/Sen4Agri_31TCG/label/val
+
+# raw 模式数据路径（input.mode=raw 时使用）
+raw:
+  dataset_root: /mnt/data/mhy/RSFM/AEF-seg-learning/data/Sen4Agri_31TCG/raw
+  label_root: /mnt/data/mhy/RSFM/AEF-seg-learning/data/Sen4Agri_31TCG/label
+  train_split: train
+  val_split: val
+  s1_key: ""
+  s2_key: sentinel2
+  label_key: labels
+  time_steps: 12
+
+# 可选：自动网格搜索（先手动可置 false）
+search:
+  enabled: false
+  grid:
+    train.lr: [1e-5, 1e-3]
+    model.base_channels: [4, 8]
+    train.dice_weight: [0.3, 0.4]

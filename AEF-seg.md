@@ -134,54 +134,62 @@ python -m data.download_gee_l8_s1_s2 `
 训练命令示例（CPU, tiny, 重建优先）：
 
 ```bash
+# 继续 base / small 任意一版，从当前输出目录的 latest 续训
 python -m alphaearth.run_train_gee_multisource \
-  --data_dir   D:/ProgramFiles/AEF/alphaearth-foundations/data/gee_multi \
-  --output_dir D:/ProgramFiles/AEF/alphaearth-foundations/outputs_gee_multisource_tiny \
-  --batch_size 1 \
-  --num_workers 0 \
-  --patch_size 128 \
-  --model_size tiny \
-  --max_steps 1000 \
-  --warmup_steps 0 \
-  --log_every 50 \
-  --device cpu \
-  --reconstruction_weight 1.0 \
-  --uniformity_weight 0.05 \
-  --consistency_weight 0.02
+--data_dir /mnt/data/mhy/dataset/PASTIS-R/raw/train \
+--model_size tiny \
+--batch_size 4 \
+--grad_accum_steps 4 \
+--num_workers 4 \
+--max_time_steps 16 \
+--input_sources sentinel1,sentinel2 \
+--reconstruction_sources sentinel1,sentinel2 \
+--resume_checkpoint /mnt/data/mhy/RSFM/AEF-seg-learning/data/Pastis-R/outputs_tiny_3/checkpoint_latest.pt \
+--resume_load_optimizer 0 \
+--reset_step_on_resume 1 \
+--resume_strict 0 \
+--lr 1e-6 \
+--max_steps 2000 \
+--uniformity_weight 0.1 \
+--consistency_weight 0.01 \
+--detail_weight 0.3 \
+--device cuda \
+--ssim_weight 0.3 \
+--highfreq_weight 0.14 \
+--source_weight_sentinel1 1.0 \
+--source_weight_sentinel2 1.0 \
+--uniformity_ramp_steps 100 \
+--consistency_ramp_steps 100 \
+--output_dir /mnt/data/mhy/RSFM/AEF-seg-learning/data/Pastis-R/outputs_tiny_4 \
+--log_every 20
 ```
-PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-python -m alphaearth.run_train_gee_multisource \
-  --data_dir /mnt/data/RSFM/AEF-seg-learning/data/S1S2/gee_multi1 \
-  --output_dir /mnt/data/RSFM/AEF-seg-learning/data/S1S2/outputs_gee_multisource_tiny \
-  --batch_size 2 \
-  --num_workers 2 \
-  --patch_size 128 \
-  --model_size tiny \
-  --max_steps 3000 \
-  --warmup_steps 0 \
-  --log_every 50 \
-  --device cuda \
-  --reconstruction_weight 1.0 \
-  --uniformity_weight 0.01 \
-  --consistency_weight 0.005 \
-  --reconstruction_sources sentinel1,sentinel2 \
-  --amp 1 \
-  --grad_checkpoint 1
 
-python -m alphaearth.run_train_gee_multisource `
---data_dir "D:/ProgramFiles/AEF/alphaearth-foundations/data/gee_multi1" `
---output_dir "D:/ProgramFiles/AEF/alphaearth-foundations/outputs_gee_multisource_tiny" `
---batch_size 1 `
---num_workers 0 `
---patch_size 128 `
---model_size tiny `
---max_steps 3000 `
---warmup_steps 0 `
---log_every 50 `
---device cpu `
---reconstruction_weight 1.0 `
---uniformity_weight 0.05 `
---consistency_weight 0.02
+python -m alphaearth.run_train_gee_multisource \
+--data_dir /mnt/data/RSFM/AEF-seg-learning/data/MTS12/train \
+--model_size tiny \
+--batch_size 1 \
+--grad_accum_steps 4 \
+--num_workers 2 \
+--max_time_steps 16 \
+--input_sources sentinel1,sentinel2 \
+--reconstruction_sources sentinel1,sentinel2 \
+--resume_checkpoint /mnt/data/RSFM/AEF-seg-learning/data/MTS12/embeddings/tiny_s1s23/checkpoint_latest.pt \
+--resume_load_optimizer 0 \
+--reset_step_on_resume 1 \
+--resume_strict 0 \
+--lr 1e-5 \
+--max_steps 2000 \
+--uniformity_weight 0.01 \
+--consistency_weight 0.01 \
+--detail_weight 0.4 \
+--ssim_weight 0.3 \
+--highfreq_weight 0.14 \
+--source_weight_sentinel1 1.0 \
+--source_weight_sentinel2 1.2 \
+--uniformity_ramp_steps 100 \
+--consistency_ramp_steps 100 \
+--output_dir /mnt/data/RSFM/AEF-seg-learning/data/MTS12/embeddings/tiny_s1s24 \
+--log_every 20
 
 
 
@@ -200,14 +208,15 @@ python -m alphaearth.run_train_gee_multisource `
 - 使用 `summary_strategy=full_period`（默认）：
 
 ```bash
-python -m alphaearth.run_infer_gee_multisource `
-  --data_dir   D:/ProgramFiles/AEF/alphaearth-foundations/data/gee_multi `
-  --checkpoint D:/ProgramFiles/AEF/alphaearth-foundations/outputs_gee_multisource_tiny/checkpoint_latest.pt `
-  --output_dir D:/ProgramFiles/AEF/alphaearth-foundations/outputs_gee_multisource_tiny/embeddings `
-  --batch_size 1 `
-  --num_workers 0 `
-  --patch_size 128 `
-  --device cpu `
+python -m alphaearth.run_infer_gee_multisource \
+  --data_dir   /mnt/data/mhy/dataset/PASTIS-R/raw/test \
+  --checkpoint /mnt/data/mhy/RSFM/AEF-seg-learning/data/Pastis-R/outputs_tiny_4/checkpoint_latest.pt \
+  --output_dir /mnt/data/mhy/RSFM/AEF-seg-learning/data/Pastis-R/embedding/S12/test \
+  --batch_size 1 \
+  --num_workers 0 \
+  --patch_size 128 \
+  --max_time_steps 8 \
+  --device cuda \
   --model_size tiny
 ```
 
@@ -299,6 +308,11 @@ python -m alphaearth.visualize_labels \
   --output D:/ProgramFiles/AEF/alphaearth-foundations/data/label/ParcelIDs_10000_labels.jpg
 ```
 
+
+python -m seg.visualize_aef_s12_raw_label --aef_root /mnt/data/mhy/RSFM/AEF-seg-learning/data/MTS12/embeddings/AEF_npz --s12_emb_root /mnt/data/mhy/RSFM/AEF-seg-learning/data/MTS12/embeddings/S12 --raw_root /mnt/data/mhy/RSFM/AEF-seg-learning/data/MTS12/S12 --split train --output_dir /mnt/data/mhy/RSFM/AEF-seg-learning/data/MTS12/result/vis
+
+
+
 ## 6. 使用 64 维 embedding 进行 U-Net 分割训练
 
 脚本：`src/alphaearth/train_unet_from_embeddings.py`
@@ -325,46 +339,17 @@ python -m alphaearth.visualize_labels \
 
 ### 6.3 训练命令
 
-```bash
-python -m alphaearth.train_unet_from_embeddings `
-  --embeddings_npz D:\ProgramFiles\AEF\alphaearth-foundations\outputs_gee_multisource_tiny\embeddings `
-  --labels_file   D:\ProgramFiles\AEF\alphaearth-foundations\data\label\labels_npz `
-  --output_dir    D:/ProgramFiles/AEF/alphaearth-foundations/outputs_seg_unet `
-  --epochs 10 `
-  --lr 1e-3 `
-  --num_classes 20 `
-  --ignore_index 19 `
-  --base_channels 32 `
-  --device cpu
-```
+训练（手动参数）
+python -m seg.train_seg_unified train --config seg/configs/seg_unet_pastisR_embedding.yaml
 
-- 控制台会打印：
-  - `features` 与 `labels` 的 shape，对齐情况；
-  - 每个 epoch 的 loss；
-- 训练结束后：
-  - `outputs_seg_unet/unet_from_embeddings_latest.pt`：U-Net checkpoint（包含 `model_state_dict` 与 `in_channels`）。
+python -m seg.train_random_forest_from_embeddings train --config seg/configs/seg_rf_pastisR_aef.yaml
 
-## 7. 将 pipeline 适配你的数据
+python -m seg.train_unet_from_embeddings --config seg/configs/seg_unet_Sen4Agri_decoder.yaml
 
-1. **准备 shapefile**：
-   - 确保每个 feature 是 128×128 patch polygon；
-   - 添加 `ID_patch` 字段（int），与外部的 patch/parcel 编号一致；
+续训
+python -m seg.train_seg_unified train --config seg/configs/seg_unet_mts12_embedding.yaml --resume
 
-2. **准备 annotation**：
-   - 若已有 `ParcelIDs_10000.npy`（或类似）和 colormap + label_names：
-     - 用 convert_label_to_indices 生成 `*_labels.npz`；
-     - 用 visualize_labels 检查标签是否合理。
-
-3. **下载多源时序影像**：
-   - 用 download_gee_l8_s1_s2 处理整个 shapefile，输出 per-patch 的 sample_XXXXX.npz；
-
-4. **训练 AEF 多源模型**：
-   - 用 run_train_gee_multisource 在 gee_multi 数据上训练，获得 checkpoint；
-
-5. **生成 64 维 embedding（含时间维）**：
-   - 用 run_infer_gee_multisource 的 per_timestamp 模式生成 embedding_timeseries_XXXX.npz；
-
-6. **构建分割训练数据 & 训练 U-Net**：
-   - 选取若干 patch 的 embedding_timeseries_XXXX.npz + 对应标签（来自 *_labels.npz）；
-   - 用 train_unet_from_embeddings 训练 U-Net，实现基于 AEF embedding 的分割。
-
+验证
+python -m seg.train_seg_unified eval \
+  --config /mnt/data/mhy/RSFM/AEF-seg-learning/data/MTS12/result/outputs_AEF/trials/trial_006/resolved_config.json \
+  --checkpoint /mnt/data/mhy/RSFM/AEF-seg-learning/data/MTS12/result/outputs_AEF/trials/trial_006/checkpoints/best.pt

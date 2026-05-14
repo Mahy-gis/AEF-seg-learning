@@ -2,7 +2,7 @@ input:
   mode: raw   # embedding | raw
 
 labels:
-  num_classes: 12
+  num_classes: 20
   ignore_index: 255
   background_index: 0
   ignore_background_in_metrics: true
@@ -11,18 +11,18 @@ labels:
 model:
   variant: basic    # basic | resse | lightweight | aspp
   depth: 4
-  base_channels: 16
+  base_channels: 8
   norm: group
   dropout: 0.1
 
 train:
-  epochs: 70
-  batch_size: 4
-  num_workers: 4
+  epochs: 200
+  batch_size: 2
+  num_workers: 2
   persistent_workers: true
   prefetch_factor: 4
-  val_interval: 2
-  lr: 3e-4
+  val_interval: 1
+  lr: 1e-4
   weight_decay: 1e-4
   seed: 42
   val_fraction: 0.2
@@ -34,35 +34,35 @@ train:
   validate_first_epoch: false
 
   dice_weight: 0.4
-  ce_weight: 0.0
+  ce_weight: 0.2
+  fg_aux_weight: 0.1
+  bg_ratio_weight: 0.05
   focal_gamma: 2.0
-  focal_class_weights: "0,1,1,1,1,1,1,1,1,1,1,1"
-  focal_focus_classes: all_fg
+  focal_class_weights: "0.200,0.761,2.306,1.101,0.286,0.556,0.403,2.539,0.210,2.542,0.247,1.494,0.514,1.366,0.380,1.212,0.303,0.587,0.315"
+  focal_focus_classes: all
 
   save_val_samples: 0
 
 data:
   resample_size: 0
-  normalize_features: false
+  normalize_features: true
   feature_stats_max_samples: 0
 
   enable_augmentation: true
-  train_repeat_factor: 1
+  train_repeat_factor: 2
   aug_flip_prob: 0.5
   aug_rot90_prob: 0.5
   aug_noise_std: 0.01
   aug_gain_std: 0.05
-  train_crop_size: 256
-  fg_crop_prob: 0.8
-  fg_aug_boost: 2.0
-
-  use_fg_sampler: false
+  train_crop_size: 128
+  fg_crop_prob: 0.5
+  use_fg_sampler: true
   fg_sampler_power: 1.5
   fg_sampler_min_weight: 0.2
 
 runtime:
-  device: cuda:0
-  output_dir: /mnt/data/mhy/RSFM/AEF-seg-learning/data/Sen4Agri_31TCG/result/outputs_raw_basic
+  device: cuda:1
+  output_dir: /mnt/data/mhy/RSFM/AEF-seg-learning/data/Pastis-R/result/outputs_raw
   resume: false
   resume_checkpoint: ""
   resume_strict: true
@@ -77,18 +77,18 @@ runtime:
 embedding:
   embedding_key: embeddings
   per_patch_labels: false
-  train_embeddings_path: /mnt/data/mhy/RSFM/AEF-seg-learning/data/Sen4Agri_31TCG/embedding/AEF/train
-  train_labels_path: /mnt/data/mhy/RSFM/AEF-seg-learning/data/Sen4Agri_31TCG/label/train
-  val_embeddings_path: /mnt/data/mhy/RSFM/AEF-seg-learning/data/Sen4Agri_31TCG/embedding/AEF/val
-  val_labels_path: /mnt/data/mhy/RSFM/AEF-seg-learning/data/Sen4Agri_31TCG/label/val
+  train_embeddings_path: /mnt/data/mhy/RSFM/AEF-seg-learning/data/Pastis-R/embedding/AEF_npz/train
+  train_labels_path: /mnt/data/mhy/RSFM/AEF-seg-learning/data/Pastis-R/label/train
+  val_embeddings_path: /mnt/data/mhy/RSFM/AEF-seg-learning/data/Pastis-R/embedding/AEF_npz/val
+  val_labels_path: /mnt/data/mhy/RSFM/AEF-seg-learning/data/Pastis-R/label/val
 
 # raw 模式数据路径（input.mode=raw 时使用）
 raw:
-  dataset_root: /mnt/data/mhy/RSFM/AEF-seg-learning/data/Sen4Agri_31TCG/raw
-  label_root: /mnt/data/mhy/RSFM/AEF-seg-learning/data/Sen4Agri_31TCG/label
+  dataset_root: /mnt/data/mhy/dataset/PASTIS-R/raw
+  label_root: /mnt/data/mhy/RSFM/AEF-seg-learning/data/Pastis-R/label
   train_split: train
   val_split: val
-  s1_key: ""
+  s1_key: sentinel1
   s2_key: sentinel2
   label_key: labels
   time_steps: 12
@@ -97,6 +97,6 @@ raw:
 search:
   enabled: false
   grid:
-    train.lr: [1e-5, 1e-3]
+    train.lr: [1e-6, 1e-4]
     model.base_channels: [4, 8]
     train.dice_weight: [0.3, 0.4]

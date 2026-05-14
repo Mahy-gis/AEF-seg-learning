@@ -1,5 +1,5 @@
 input:
-  mode: embedding   # embedding | raw
+  mode: raw   # embedding | raw
 
 labels:
   num_classes: 9
@@ -65,7 +65,7 @@ data:
   fg_sampler_min_weight: 0.5
 
 runtime:
-  device: cuda:0
+  device: cuda:1
   output_dir: /mnt/data/mhy/RSFM/AEF-seg-learning/data/MTS12/result/outputs_AEF
   resume: false
   resume_checkpoint: /mnt/data/mhy/RSFM/AEF-seg-learning/data/MTS12/result/outputs_raw_resse/checkpoints/latest.pt
@@ -99,7 +99,7 @@ raw:
 
 # 可选：自动网格搜索（先手动可置 false）
 search:
-  enabled: true
+  enabled: false
   grid:
     train.lr: [1e-6, 1e-2]
     model.base_channels: [8, 32]

@@ -1,0 +1,61 @@
+# Example config for training UNet decoder from embeddings
+# Aligned to seg_unet_mts12_embedding.yaml (full UNet embedding settings).
+
+# Data paths
+embeddings_path: /mnt/data/mhy/RSFM/AEF-seg-learning/data/Sen4Agri_31TCG/embedding/AEF/train
+labels_file: /mnt/data/mhy/RSFM/AEF-seg-learning/data/Sen4Agri_31TCG/label/train
+per_patch_labels: false
+embedding_key: embeddings
+resample_size: 0
+
+# Optional external validation set (comment out if not used)
+val_embeddings_path: /mnt/data/mhy/RSFM/AEF-seg-learning/data/Sen4Agri_31TCG/embedding/AEF/val
+val_labels_file: /mnt/data/mhy/RSFM/AEF-seg-learning/data/Sen4Agri_31TCG/label/val
+
+# Model
+model_variant: from_embeddings
+freeze_encoder: 1
+base_channels: 16
+unet_depth: 4
+num_classes: 12
+ignore_index: 255
+background_index: 0
+norm_type: group
+dropout_rate: 0.1
+
+# Training
+batch_size: 4
+num_workers: 4
+epochs: 70
+lr: 3e-4
+weight_decay: 1e-4
+output_dir: /mnt/data/mhy/RSFM/AEF-seg-learning/data/Sen4Agri_31TCG/result/outputs_AEF_decoder
+device: cuda:0
+seed: 42
+val_fraction: 0.2
+early_stop_patience: 10
+lr_patience: 5
+lr_decay_factor: 0.5
+min_lr: 1e-6
+scheduler_monitor: val_miou
+
+# Loss / metrics
+ignore_background_in_metrics: 1
+ignore_background_in_dice: 1
+dice_weight: 0.5
+save_val_samples: 0
+
+# Feature normalization / augmentation
+normalize_features: 0
+feature_stats_max_samples: 0
+enable_augmentation: 1
+train_repeat_factor: 1
+aug_flip_prob: 0.5
+aug_rot90_prob: 0.5
+aug_noise_std: 0.01
+aug_gain_std: 0.05
+train_crop_size: 512
+fg_crop_prob: 0.5
+use_fg_sampler: 1
+fg_sampler_power: 2.0
+fg_sampler_min_weight: 0.5

@@ -1,9 +1,9 @@
 input:
-  mode: embedding   # embedding | raw
+  mode: raw   # embedding | raw
 
 labels:
   num_classes: 20
-  ignore_index: 19
+  ignore_index: 255
   background_index: 0
   ignore_background_in_metrics: true
   ignore_background_in_dice: true

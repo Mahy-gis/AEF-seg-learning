@@ -563,7 +563,7 @@ def _run_one_epoch(
     avg_acc = running_correct / max(1, running_total) if running_total > 0 else 0.0
     avg_miou = running_miou_sum / max(1, running_miou_count)
     pred_bg_ratio = running_pred_bg / max(1, running_pred_total)
-    precision, recall, f1, macro_precision, macro_recall, macro_f1, weighted_f1 = compute_f1_from_confusion_matrix(
+    precision, recall, f1, macro_precision, macro_recall, macro_f1, weighted_f1, class_weights = compute_f1_from_confusion_matrix(
         running_confusion,
         background_index=background_index,
         ignore_background=ignore_background_in_metrics,
@@ -576,8 +576,9 @@ def _run_one_epoch(
         "precision": float(macro_precision),
         "recall": float(macro_recall),
         "f1": float(macro_f1),
-        "mf1": float(macro_f1),
+        "mf1": float(weighted_f1),
         "weighted_f1": float(weighted_f1),
+        "mf1_class_weights": class_weights.tolist(),
         "per_class_precision": precision.tolist(),
         "per_class_recall": recall.tolist(),
         "per_class_f1": f1.tolist(),
@@ -1214,6 +1215,7 @@ def _train_once(cfg: Dict[str, Any]) -> Dict[str, Any]:
             "best_val_miou": float(best_val_miou),
             "best_val_f1": float(best_val_f1),
             "best_val_mf1": float(best_val_mf1),
+            "best_val_mf1_class_weights": final_val_stats["mf1_class_weights"],
             "best_val_precision": float(final_val_stats["precision"]),
             "best_val_recall": float(final_val_stats["recall"]),
         },
@@ -1451,6 +1453,7 @@ def _run_eval_command(args: argparse.Namespace) -> None:
             "val_miou": float(stats["miou"]),
             "val_f1": float(stats["f1"]),
             "val_mf1": float(stats["mf1"]),
+            "val_mf1_class_weights": stats["mf1_class_weights"],
             "val_precision": float(stats["precision"]),
             "val_recall": float(stats["recall"]),
             "val_pred_bg_ratio": float(stats["pred_bg_ratio"]),

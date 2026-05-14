@@ -22,7 +22,7 @@ train:
   persistent_workers: true
   prefetch_factor: 4
   val_interval: 2
-  lr: 3e-4
+  lr: 1e-4
   weight_decay: 1e-4
   seed: 42
   val_fraction: 0.2
@@ -61,7 +61,7 @@ data:
   fg_sampler_min_weight: 0.2
 
 runtime:
-  device: cuda:0
+  device: cuda:1
   output_dir: /mnt/data/mhy/RSFM/AEF-seg-learning/data/Sen4Agri_31TCG/result/outputs_raw_basic
   resume: false
   resume_checkpoint: ""

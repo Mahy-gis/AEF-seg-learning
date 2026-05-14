@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader, Subset, WeightedRandomSampler
 import matplotlib.pyplot as plt
+import yaml
 
 
 # ---------- Data preparation helpers ----------
@@ -1483,8 +1484,8 @@ def compute_f1_from_confusion_matrix(
     background_index: int = 0,
     ignore_background: bool = True,
     class_indices: Optional[List[int]] = None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, float, float, float, float]:
-    """Return per-class precision/recall/F1 and macro/weighted averages.
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, float, float, float, float, np.ndarray]:
+    """Return per-class precision/recall/F1, macro averages, weighted F1, and class weights.
 
     The confusion matrix is expected to be shaped (num_classes, num_classes)
     with rows = ground truth and columns = predictions.
@@ -1520,15 +1521,19 @@ def compute_f1_from_confusion_matrix(
         support_sum = float(np.sum(support))
         if support_sum > 0.0:
             weighted_f1 = float(np.sum(f1[valid_classes] * support) / support_sum)
+            class_weights = np.zeros(cm.shape[0], dtype=np.float64)
+            class_weights[valid_classes] = support / support_sum
         else:
             weighted_f1 = 0.0
+            class_weights = np.zeros(cm.shape[0], dtype=np.float64)
     else:
         macro_precision = 0.0
         macro_recall = 0.0
         macro_f1 = 0.0
         weighted_f1 = 0.0
+        class_weights = np.zeros(cm.shape[0], dtype=np.float64)
 
-    return precision, recall, f1, macro_precision, macro_recall, macro_f1, weighted_f1
+    return precision, recall, f1, macro_precision, macro_recall, macro_f1, weighted_f1, class_weights
 
 
 def save_confusion_matrix_visualization(
@@ -2092,6 +2097,18 @@ def train(args: argparse.Namespace):
             norm=args.norm_type,
         )
         print(f"Model: DeepLabLite(base_channels={args.base_channels})")
+    elif args.model_variant == "from_embeddings":
+        # dynamic import to avoid circular import at module load time
+        from .unet_decoder import UNetFromEmbeddings
+
+        model = UNetFromEmbeddings(
+            embedding_channels=C,
+            num_classes=args.num_classes,
+            base_ch=args.base_channels,
+            norm=args.norm_type,
+            freeze_encoder=bool(args.freeze_encoder),
+        )
+        print(f"Model: UNetFromEmbeddings(base_channels={args.base_channels}, freeze_encoder={args.freeze_encoder})")
     else:
         if args.unet_depth == 5:
             model = UNetDeep(
@@ -2218,6 +2235,8 @@ def train(args: argparse.Namespace):
     best_val_loss = float("inf")
     best_val_acc = 0.0
     best_val_miou = 0.0
+    best_val_weighted_f1 = 0.0
+    best_val_mf1 = 0.0
     best_state = None
     epochs_no_improve = 0
 
@@ -2312,6 +2331,8 @@ def train(args: argparse.Namespace):
         val_loss = None
         val_acc = None
         val_miou = None
+        val_weighted_f1 = None
+        val_mf1 = None
         if val_loader is not None:
             model.eval()
             val_running_loss = 0.0
@@ -2321,6 +2342,7 @@ def train(args: argparse.Namespace):
             val_running_miou_count = 0
             val_running_pred_bg = 0
             val_running_pred_total = 0
+            val_confusion = np.zeros((args.num_classes, args.num_classes), dtype=np.int64)
             with torch.no_grad():
                 for x, y in val_loader:
                     x = x.to(device)
@@ -2368,6 +2390,12 @@ def train(args: argparse.Namespace):
                     val_running_pred_total += int(total)
                     val_running_miou_sum += miou
                     val_running_miou_count += 1
+                    val_confusion += compute_confusion_matrix(
+                        logits,
+                        y,
+                        num_classes=args.num_classes,
+                        ignore_index=args.ignore_index,
+                    )
 
             val_loss = val_running_loss / max(1, len(val_ds))
             val_acc = (
@@ -2377,6 +2405,22 @@ def train(args: argparse.Namespace):
             )
             val_miou = val_running_miou_sum / max(1, val_running_miou_count)
             val_pred_bg_ratio = val_running_pred_bg / max(1, val_running_pred_total)
+            (
+                _precision,
+                _recall,
+                _f1,
+                _macro_precision,
+                _macro_recall,
+                macro_f1,
+                weighted_f1,
+                _class_weights,
+            ) = compute_f1_from_confusion_matrix(
+                val_confusion,
+                background_index=args.background_index,
+                ignore_background=args.ignore_background_in_metrics,
+            )
+            val_weighted_f1 = weighted_f1
+            val_mf1 = macro_f1
 
             # Track best model by mIoU first, then val_loss as tie-breaker.
             improved = (val_miou > best_val_miou) or (
@@ -2386,6 +2430,8 @@ def train(args: argparse.Namespace):
                 best_val_loss = val_loss
                 best_val_acc = val_acc
                 best_val_miou = val_miou
+                best_val_weighted_f1 = val_weighted_f1
+                best_val_mf1 = val_mf1
                 best_state = model.state_dict()
                 epochs_no_improve = 0
             else:
@@ -2397,6 +2443,7 @@ def train(args: argparse.Namespace):
                 f"train_loss: {train_loss:.4f}, train_acc: {train_acc:.4f}, train_mIoU: {train_miou:.4f}, "
                 f"train_pred_bg: {train_pred_bg_ratio:.4f}, "
                 f"val_loss: {val_loss:.4f}, val_acc: {val_acc:.4f}, val_mIoU: {val_miou:.4f}, "
+                f"val_mF1: {val_mf1:.4f}, val_weighted_F1: {val_weighted_f1:.4f}, "
                 f"val_pred_bg: {val_pred_bg_ratio:.4f}, "
                 f"lr: {optimizer.param_groups[0]['lr']:.2e}"
             )
@@ -2426,17 +2473,17 @@ def train(args: argparse.Namespace):
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Save latest model
-    ckpt_latest = out_dir / "unet_from_embeddings_latest.pt"
+    # Save latest model (filename reflects model variant)
+    ckpt_latest = out_dir / f"{args.model_variant}_latest.pt"
     torch.save({"model_state_dict": model.state_dict(), "in_channels": C}, ckpt_latest)
-    print(f"Saved latest U-Net checkpoint to {ckpt_latest}")
+    print(f"Saved latest model checkpoint to {ckpt_latest}")
 
     # Save best model (by validation)
     if best_state is not None:
-        ckpt_best = out_dir / "unet_from_embeddings_best.pt"
+        ckpt_best = out_dir / f"{args.model_variant}_best.pt"
         torch.save({"model_state_dict": best_state, "in_channels": C}, ckpt_best)
         print(
-            f"Saved best U-Net checkpoint to {ckpt_best} "
+            f"Saved best model checkpoint to {ckpt_best} "
             f"(val_loss={best_val_loss:.4f}, val_acc={best_val_acc:.4f}, val_mIoU={best_val_miou:.4f})"
         )
 
@@ -2478,6 +2525,8 @@ def train(args: argparse.Namespace):
         "best_val_loss": float(best_val_loss),
         "best_val_acc": float(best_val_acc),
         "best_val_miou": float(best_val_miou),
+        "best_val_weighted_f1": float(best_val_weighted_f1),
+        "best_val_mf1": float(best_val_mf1),
     }
 
 
@@ -2491,7 +2540,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument(
         "--embeddings_path",
         type=str,
-        required=True,
+        default="",
         help=(
             "Path to embeddings. If a file, uses a single sample. If a "
             "directory, uses all *.npy files inside as separate samples."
@@ -2512,7 +2561,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument(
         "--labels_file",
         type=str,
-        required=True,
+        default="",
         help=(
             "Labels file (.npy integer mask). "
             "If this is a directory, per-patch matching is enabled automatically; "
@@ -2542,7 +2591,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument(
         "--output_dir",
         type=str,
-        required=True,
+        default="",
         help="Directory to save checkpoints and logs",
     )
     p.add_argument("--epochs", type=int, default=10, help="Number of training epochs")
@@ -2594,7 +2643,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--model_variant",
         type=str,
         default="basic",
-        choices=["basic", "resse", "lightweight", "aspp"],
+        choices=["basic", "resse", "lightweight", "aspp", "from_embeddings"],
         help="Segmentation model variant: basic VGG16-style UNet, resse UNet, lightweight UNet, or aspp DeepLabLite",
     )
     p.add_argument(
@@ -2609,6 +2658,19 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         default="instance",
         choices=["instance", "group", "batch"],
         help="Normalization layer type in UNet blocks: instance, group, or batch (default instance)",
+    )
+    p.add_argument(
+        "--freeze_encoder",
+        type=int,
+        default=1,
+        choices=[0, 1],
+        help="If 1, freeze encoder weights when using from_embeddings variant (default 1)",
+    )
+    p.add_argument(
+        "--config",
+        type=str,
+        default="",
+        help="Path to YAML config file to override args",
     )
     p.add_argument(
         "--val_fraction",
@@ -2900,7 +2962,62 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         default=42,
         help="Random seed for train/val split and reproducibility (default 42)",
     )
-    return p.parse_args(argv)
+    args = p.parse_args(argv)
+
+    # If YAML config provided, load and override matching arguments
+    def _coerce_config_value(ref_value, new_value):
+        if new_value is None:
+            return new_value
+        # Preserve bool before int (bool is subclass of int)
+        if isinstance(ref_value, bool):
+            if isinstance(new_value, str):
+                v = new_value.strip().lower()
+                if v in ("1", "true", "yes", "y", "on"):
+                    return True
+                if v in ("0", "false", "no", "n", "off"):
+                    return False
+            return bool(new_value)
+        if isinstance(ref_value, int) and not isinstance(ref_value, bool):
+            if isinstance(new_value, str):
+                try:
+                    return int(new_value)
+                except ValueError:
+                    return int(float(new_value))
+            if isinstance(new_value, float):
+                return int(new_value)
+        if isinstance(ref_value, float):
+            if isinstance(new_value, str):
+                return float(new_value)
+            return float(new_value)
+        if isinstance(ref_value, str):
+            return str(new_value)
+        return new_value
+
+    if getattr(args, "config", ""):
+        cfg_path = Path(args.config)
+        if not cfg_path.exists():
+            raise FileNotFoundError(f"YAML config not found: {cfg_path}")
+        with cfg_path.open("r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+        for k, v in cfg.items():
+            if hasattr(args, k):
+                current = getattr(args, k)
+                setattr(args, k, _coerce_config_value(current, v))
+            else:
+                print(f"Warning: unknown config key '{k}' in {cfg_path}, ignoring")
+
+    missing = [
+        name for name in ("embeddings_path", "labels_file", "output_dir")
+        if not getattr(args, name)
+    ]
+    if missing:
+        raise ValueError(
+            "Missing required arguments: "
+            + ", ".join(missing)
+            + ". Provide them via CLI or in the YAML config."
+        )
+
+    return args
 
 
 def main() -> None:

@@ -1,0 +1,60 @@
+input:
+  mode: raw   # embedding | raw
+
+labels:
+  num_classes: 12
+  ignore_index: 255
+  background_index: 0
+  ignore_background_in_metrics: true
+
+rf:
+  backend: gpu
+  n_estimators: 300
+  max_features_mode: input_channels   # input_channels | fixed
+  max_features_value: 64               # used only when max_features_mode=fixed
+  min_samples_leaf: 1  #1
+  bootstrap: true
+  max_samples: 1   #1
+  random_state: 42
+  n_jobs: -1
+  verbose: 0
+
+data:
+  resample_size: 0
+  val_fraction: 0.2
+  max_train_pixels_per_image: 2048
+  max_train_pixels_total: 200000
+  augment_repeats: 2
+  augment_hflip_prob: 0.5
+  augment_vflip_prob: 0.5
+  augment_rot90: true
+  augment_noise_std: 0.0
+  balance_minority_pixels: true
+  balance_max_multiplier: 4.0
+  balance_include_background: false
+  save_val_samples: 4
+
+train:
+  seed: 42
+
+runtime:
+  device: cuda
+  output_dir: /mnt/data/mhy/RSFM/AEF-seg-learning/data/Sen4Agri_31TCG/result/rf_outputs_raw
+
+embedding:
+  embedding_key: auto
+  per_patch_labels: false
+  train_embeddings_path: /mnt/data/mhy/RSFM/AEF-seg-learning/data/Sen4Agri_31TCG/embedding/AEF/train
+  train_labels_path: /mnt/data/mhy/RSFM/AEF-seg-learning/data/Sen4Agri_31TCG/label/train
+  val_embeddings_path: /mnt/data/mhy/RSFM/AEF-seg-learning/data/Sen4Agri_31TCG/embedding/AEF/val
+  val_labels_path: /mnt/data/mhy/RSFM/AEF-seg-learning/data/Sen4Agri_31TCG/label/val
+
+raw:
+  dataset_root: /mnt/data/mhy/RSFM/AEF-seg-learning/data/Sen4Agri_31TCG/raw
+  label_root: /mnt/data/mhy/RSFM/AEF-seg-learning/data/Sen4Agri_31TCG/label
+  train_split: train
+  val_split: val
+  s1_key: sentinel1
+  s2_key: sentinel2
+  label_key: labels
+  time_steps: 12

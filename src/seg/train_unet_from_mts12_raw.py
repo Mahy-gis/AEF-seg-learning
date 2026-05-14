@@ -2,6 +2,7 @@ import argparse
 import json
 import re
 import time
+from functools import lru_cache
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
@@ -242,6 +243,19 @@ def _metric_class_indices(
     return class_indices
 
 
+@lru_cache(maxsize=128)
+def _load_numpy_payload_cached(path_str: str):
+    path = Path(path_str)
+    data = np.load(path, allow_pickle=True)
+    if isinstance(data, np.lib.npyio.NpzFile):
+        payload = {k: data[k] for k in data.files}
+        data.close()
+        return payload
+    if isinstance(data, np.ndarray) and data.dtype == object and data.shape == ():
+        return data.item()
+    return data
+
+
 class PastisRawSegmentationDataset(Dataset):
     def __init__(
         self,
@@ -339,20 +353,12 @@ class PastisRawSegmentationDataset(Dataset):
         if not s2_key:
             raise ValueError("s2_key is empty; at least one source key is required for raw training.")
 
-        raw_data = np.load(raw_file, allow_pickle=True)
+        raw_data = _load_numpy_payload_cached(str(raw_file))
         raw_container: Optional[Dict[str, np.ndarray]] = None
         raw_array: Optional[np.ndarray] = None
 
-        if isinstance(raw_data, np.lib.npyio.NpzFile):
-            raw_container = {k: raw_data[k] for k in raw_data.files}
-            raw_data.close()
-        elif isinstance(raw_data, np.ndarray) and raw_data.dtype == object and raw_data.shape == ():
-            obj = raw_data.item()
-            if not isinstance(obj, dict):
-                raise TypeError(
-                    f"Unsupported object npy payload in {raw_file}: expected dict, got {type(obj)}"
-                )
-            raw_container = obj
+        if isinstance(raw_data, dict):
+            raw_container = raw_data
         elif isinstance(raw_data, np.ndarray):
             # Support raw tensors saved directly as numpy arrays.
             raw_array = raw_data
@@ -407,43 +413,23 @@ class PastisRawSegmentationDataset(Dataset):
         else:
             x_chw = x_s2.astype(np.float32)
 
-        if lbl_file.suffix.lower() == ".npz":
-            with np.load(lbl_file, allow_pickle=True) as lbl_npz:
-                if self.label_key in lbl_npz:
-                    y = lbl_npz[self.label_key]
-                elif "labels" in lbl_npz:
-                    y = lbl_npz["labels"]
-                else:
-                    available = list(lbl_npz.keys())
-                    if len(available) == 1:
-                        y = lbl_npz[available[0]]
-                    else:
-                        raise KeyError(
-                            f"Label key '{self.label_key}' not found in {lbl_file}. "
-                            f"Available keys: {available}"
-                        )
-        else:
-            y_raw = np.load(lbl_file, allow_pickle=True)
-            if isinstance(y_raw, np.ndarray) and y_raw.dtype == object and y_raw.shape == ():
-                y_obj = y_raw.item()
-                if isinstance(y_obj, dict):
-                    if self.label_key in y_obj:
-                        y = y_obj[self.label_key]
-                    elif "labels" in y_obj:
-                        y = y_obj["labels"]
-                    else:
-                        available = list(y_obj.keys())
-                        if len(available) == 1:
-                            y = y_obj[available[0]]
-                        else:
-                            raise KeyError(
-                                f"Label key '{self.label_key}' not found in {lbl_file}. "
-                                f"Available keys: {available}"
-                            )
-                else:
-                    y = y_obj
+        y_raw = _load_numpy_payload_cached(str(lbl_file))
+        if isinstance(y_raw, dict):
+            if self.label_key in y_raw:
+                y = y_raw[self.label_key]
+            elif "labels" in y_raw:
+                y = y_raw["labels"]
             else:
-                y = y_raw
+                available = list(y_raw.keys())
+                if len(available) == 1:
+                    y = y_raw[available[0]]
+                else:
+                    raise KeyError(
+                        f"Label key '{self.label_key}' not found in {lbl_file}. "
+                        f"Available keys: {available}"
+                    )
+        else:
+            y = y_raw
 
         y = np.asarray(y).squeeze().astype(np.int64)
         if y.ndim != 2:
@@ -621,6 +607,8 @@ def train(args: argparse.Namespace):
         sampler=train_sampler,
         num_workers=args.num_workers,
         pin_memory=device.type == "cuda",
+        persistent_workers=args.num_workers > 0,
+        prefetch_factor=2 if args.num_workers > 0 else None,
     )
 
     val_loader = DataLoader(
@@ -629,6 +617,8 @@ def train(args: argparse.Namespace):
         shuffle=False,
         num_workers=args.num_workers,
         pin_memory=device.type == "cuda",
+        persistent_workers=args.num_workers > 0,
+        prefetch_factor=2 if args.num_workers > 0 else None,
     )
 
     if args.model_variant == "resse":
@@ -863,21 +853,18 @@ def train(args: argparse.Namespace):
         val_acc = val_running_correct / max(1, val_running_total) if val_running_total > 0 else 0.0
         val_miou = val_running_miou_sum / max(1, val_running_miou_count)
         val_pred_bg_ratio = val_running_pred_bg / max(1, val_running_pred_total)
-        val_precision, val_recall, val_f1, val_macro_precision, val_macro_recall, val_mf1, val_weighted_f1 = compute_f1_from_confusion_matrix(
+        val_precision, val_recall, val_f1, val_macro_precision, val_macro_recall, val_mf1, val_weighted_f1, val_class_weights = compute_f1_from_confusion_matrix(
             val_running_confusion,
             background_index=args.background_index,
             ignore_background=bool(args.ignore_background_in_metrics),
             class_indices=metric_class_indices,
         )
-        val_mf1_from_f1 = float(np.mean(val_f1[metric_class_indices])) if metric_class_indices else 0.0
-        class_support = val_running_confusion.sum(axis=1)
-        support = class_support[metric_class_indices]
-        support_sum = float(np.sum(support))
-        val_weighted_f1_from_f1 = (
-            float(np.sum(val_f1[metric_class_indices] * support) / support_sum)
-            if support_sum > 0.0
+        val_mf1_from_f1 = (
+            float(np.sum(val_f1[metric_class_indices] * val_class_weights[metric_class_indices]))
+            if metric_class_indices
             else 0.0
         )
+        val_weighted_f1_from_f1 = val_mf1_from_f1
         if not np.isclose(val_mf1, val_mf1_from_f1, atol=1e-8):
             raise RuntimeError(
                 f"mF1 mismatch: computed={val_mf1:.10f}, from_per_class={val_mf1_from_f1:.10f}"
@@ -993,21 +980,18 @@ def train(args: argparse.Namespace):
         final_val_acc = final_val_correct / max(1, final_val_total) if final_val_total > 0 else 0.0
         final_val_miou = final_val_miou_sum / max(1, final_val_miou_count)
         final_val_pred_bg_ratio = final_val_pred_bg / max(1, final_val_pred_total)
-        final_precision, final_recall, final_f1, final_macro_precision, final_macro_recall, final_mf1, final_weighted_f1 = compute_f1_from_confusion_matrix(
+        final_precision, final_recall, final_f1, final_macro_precision, final_macro_recall, final_mf1, final_weighted_f1, final_class_weights = compute_f1_from_confusion_matrix(
             final_val_confusion,
             background_index=args.background_index,
             ignore_background=bool(args.ignore_background_in_metrics),
             class_indices=metric_class_indices,
         )
-        final_mf1_from_f1 = float(np.mean(final_f1[metric_class_indices])) if metric_class_indices else 0.0
-        final_class_support = final_val_confusion.sum(axis=1)
-        final_support = final_class_support[metric_class_indices]
-        final_support_sum = float(np.sum(final_support))
-        final_weighted_f1_from_f1 = (
-            float(np.sum(final_f1[metric_class_indices] * final_support) / final_support_sum)
-            if final_support_sum > 0.0
+        final_mf1_from_f1 = (
+            float(np.sum(final_f1[metric_class_indices] * final_class_weights[metric_class_indices]))
+            if metric_class_indices
             else 0.0
         )
+        final_weighted_f1_from_f1 = final_mf1_from_f1
         if not np.isclose(final_mf1, final_mf1_from_f1, atol=1e-8):
             raise RuntimeError(
                 f"Final mF1 mismatch: computed={final_mf1:.10f}, from_per_class={final_mf1_from_f1:.10f}"
@@ -1076,6 +1060,7 @@ def train(args: argparse.Namespace):
             "best_val_miou": float(best_val_miou),
             "best_val_f1": float(best_val_f1),
             "best_val_mf1": float(best_val_mf1),
+            "best_val_mf1_class_weights": final_class_weights.tolist() if best_state is not None else [],
         },
         "last_metrics": {
             "train_loss": last_train_loss,
